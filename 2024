@@ -3,6 +3,8 @@ function main(workbook: ExcelScript.Workbook) {
     const SHEETS: string[] = [
         "egresados enero-junio 2024",
         "egresados agosto-dic 2024"
+
+2
     ];
     const OUT = "Base 2024";
     const RESP_SHEET = "Respondieron";
