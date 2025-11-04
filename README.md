@@ -156,14 +156,13 @@ o	Base maestra,
 o	Resumen general,
 o	Resumen detallado,
 o	Evidencia de correos enviados.
+------------------------------------------------------------------------------------------
 
 Parte 2 en exel
-🧭 Guía de Presentación del Sistema de Seguimiento de Egresados
-🧩 Objetivo general
-
+Guía de Presentación del Sistema de Seguimiento de Egresados
+Objetivo general
 Explicar de forma clara y práctica cómo funciona el Sistema de Seguimiento de Egresados, desde la creación del cuestionario hasta la obtención de resultados consolidados y visuales, aun para personas que no tienen conocimiento previo del sistema.
-
-🚀 Flujo general del proceso
+Flujo general del proceso
 1️ Generar el cuestionario
 Propósito: obtener datos actualizados sobre los egresados (contacto, empleo, opinión, seguimiento).
 Preguntas clave:
@@ -213,7 +212,7 @@ Preguntas guía:
 ¿Dónde se almacenarán los datos recibidos?
 Acción: exportar las respuestas del formulario a una hoja de cálculo y mantener respaldo semanal.
 
-7️.-¿Qué sigue después de recibir las respuestas? 💡
+7️.-¿Qué sigue después de recibir las respuestas? 
 Una vez cerrada la etapa de recepción, se continúa con la automatización en Excel (Office Scripts):
 
 🔹 Paso 7.1 — Actualizar la hoja Respondieron
