@@ -1,0 +1,505 @@
+function main(workbook: ExcelScript.Workbook) {
+  // ===== CONFIG =====
+  const OUT = "Base Maestra";
+  const LOG = "Resumen Importación";
+  const SHRESP = "Respondieron";
+  const RESUMEN = "Resumen";
+
+  // ===== HOJAS CANDIDATAS 2022–2025 =====
+  const candidates: ExcelScript.Worksheet[] =
+    workbook.getWorksheets().filter((ws) => {
+      const n = ws.getName().toLowerCase();
+      return /egresad/.test(n) && /(2022|2023|2024|2025)/.test(n);
+    });
+  const extras = ["Egresados 2022", "Egresados 2023", "Egresados 2024", "Egresados 2025"];
+  for (const name of extras) {
+    const ws = workbook.getWorksheet(name);
+    if (ws && !candidates.includes(ws)) candidates.push(ws);
+  }
+  if (candidates.length === 0) throw new Error("No se encontraron hojas de egresados 2022–2025.");
+
+  // ===== REINICIAR OUT/LOG/RESUMEN =====
+  let out = workbook.getWorksheet(OUT);
+  if (out) out.delete();
+  out = workbook.addWorksheet(OUT);
+
+  let log = workbook.getWorksheet(LOG);
+  if (log) log.delete();
+  log = workbook.addWorksheet(LOG);
+  log.getRange("A1:C1").setValues([["Hoja origen", "Filas importadas", "Observaciones"]]);
+
+  const oldResumen = workbook.getWorksheet(RESUMEN);
+  if (oldResumen) oldResumen.delete();
+  const shResumen = workbook.addWorksheet(RESUMEN);
+
+  // ===== ENCABEZADOS =====
+  const HEADERS = [
+    "Nombre", "NumControl", "Sexo", "Edad", "Carrera", "Periodo",
+    "CorreoPersonal", "CorreoInstitucional", "Celular", "OrigenHoja", "Respondio"
+  ];
+  out.getRange("A1").getResizedRange(0, HEADERS.length - 1).setValues([HEADERS]);
+
+  // ===== IMPORTACIÓN =====
+  let nextRow = 2;
+  for (const ws of candidates) {
+    const before = nextRow;
+    nextRow = importSheetRobusto(ws, ws.getName(), out, nextRow, log);
+    const imp = nextRow - before;
+    if (imp === 0) addLog(log, ws.getName(), 0, "No se detectó encabezado/columnas útiles");
+  }
+  if (nextRow === 2) throw new Error("No se importó ninguna fila.");
+
+  // ===== MARCAR RESPUESTAS + CONTAR TOTALES =====
+  const responded: Set<string> = collectResponded(workbook.getWorksheet(SHRESP));
+  const used = out.getUsedRange();
+  if (!used) throw new Error("No hay rango usado en la hoja de salida.");
+  const vals = used.getValues();
+  const hdr = vals[0].map((v) => (v ?? "").toString().trim().toLowerCase());
+
+  const iNom = hdr.indexOf("nombre");
+  const iCP = hdr.indexOf("correopersonal");
+  const iCI = hdr.indexOf("correoinstitucional");
+  const iSex = hdr.indexOf("sexo");
+  const iResp = hdr.indexOf("respondio");
+
+  let totalSi = 0, totalNo = 0;
+
+  for (let r = 1; r < vals.length; r++) {
+    if (iNom >= 0) vals[r][iNom] = toTitle(clean(vals[r][iNom]));
+    if (iSex >= 0) vals[r][iSex] = normSexo(clean(vals[r][iSex]));
+    if (iCP >= 0) vals[r][iCP] = normalizeEmail(vals[r][iCP]);
+    if (iCI >= 0) vals[r][iCI] = normalizeEmail(vals[r][iCI]);
+
+    const cp = iCP >= 0 ? (vals[r][iCP] ?? "").toString() : "";
+    const ci = iCI >= 0 ? (vals[r][iCI] ?? "").toString() : "";
+    const hit = (cp && responded.has(cp)) || (ci && responded.has(ci));
+    if (iResp >= 0) {
+      vals[r][iResp] = hit ? "Respondió" : "No respondió";
+      if (hit) totalSi++; else totalNo++;
+    }
+  }
+  used.setValues(vals);
+
+  // ===== TABLA + ESTILO =====
+  const tbl = out.addTable(out.getUsedRange(), true);
+  tbl.setName("tblBaseMaestra");
+  tbl.setPredefinedTableStyle("TableStyleMedium9");
+
+  // Orden: Carrera → Nombre
+  tbl.getSort().apply([{ key: 4, ascending: true }, { key: 0, ascending: true }]);
+
+  const hdrRange = tbl.getHeaderRowRange();
+  hdrRange.getFormat().getFill().setColor("#0B5F9A");
+  hdrRange.getFormat().getFont().setColor("#FFFFFF");
+  hdrRange.getFormat().getFont().setBold(true);
+  hdrRange.getFormat().setHorizontalAlignment(ExcelScript.HorizontalAlignment.center);
+
+  const all = tbl.getRange();
+  all.getFormat().getFont().setName("Calibri");
+  all.getFormat().getFont().setSize(11);
+  all.getFormat().setVerticalAlignment(ExcelScript.VerticalAlignment.center);
+  all.getFormat().setWrapText(false);
+  all.getFormat().autofitColumns();
+  all.getFormat().autofitRows();
+
+  // Zebra (filas pares)
+  const bodyAddr: string = tbl.getRangeBetweenHeaderAndTotal().getAddress();
+  const zebraCF =
+    out.getRange(bodyAddr).addConditionalFormat(ExcelScript.ConditionalFormatType.custom);
+  zebraCF.getCustom().getRule().setFormula("=ISEVEN(ROW())");
+  zebraCF.getCustom().getFormat().getFill().setColor("#F7FAFF");
+
+  // Estado (Respondió / No respondió)
+  const estadoRange = tbl.getColumns()[10].getRangeBetweenHeaderAndTotal();
+  const okCF =
+    estadoRange.addConditionalFormat(ExcelScript.ConditionalFormatType.containsText);
+  okCF.getTextComparison().setRule({ operator: ExcelScript.ConditionalTextOperator.contains, text: "Respondió" });
+  okCF.getTextComparison().getFormat().getFill().setColor("#A9DFBF");
+  okCF.getTextComparison().getFormat().getFont().setColor("#000000");
+
+  const noCF =
+    estadoRange.addConditionalFormat(ExcelScript.ConditionalFormatType.containsText);
+  noCF.getTextComparison().setRule({ operator: ExcelScript.ConditionalTextOperator.contains, text: "No respondió" });
+  noCF.getTextComparison().getFormat().getFill().setColor("#F5B7B1");
+  noCF.getTextComparison().getFormat().getFont().setColor("#000000");
+
+  // Anchos mínimos
+  out.getRange("A:A").getFormat().setColumnWidth(30);
+  out.getRange("B:B").getFormat().setColumnWidth(16);
+  out.getRange("C:C").getFormat().setColumnWidth(12);
+  out.getRange("D:D").getFormat().setColumnWidth(10);
+  out.getRange("E:E").getFormat().setColumnWidth(28);
+  out.getRange("F:F").getFormat().setColumnWidth(18);
+  out.getRange("G:H").getFormat().setColumnWidth(34);
+  out.getRange("I:I").getFormat().setColumnWidth(16);
+  out.getRange("J:J").getFormat().setColumnWidth(20);
+  out.getRange("K:K").getFormat().setColumnWidth(18);
+  out.getFreezePanes().freezeRows(1);
+
+  // ===== RESUMEN (conteos + pivot) =====
+  const totalResp = totalSi + totalNo;
+  shResumen.getRange("A1:B1").setValues([["Métrica", "Valor"]]);
+  shResumen.getRange("A2:B6").setValues([
+    ["Total Sí", totalSi],
+    ["Total No", totalNo],
+    ["Total respuestas", totalResp],
+    ["% Sí", totalResp ? totalSi / totalResp : 0],
+    ["% No", totalResp ? totalNo / totalResp : 0],
+  ]);
+  shResumen.getRange("B4:B5").setNumberFormatLocal("0.0%");
+
+  // Pivot: Carrera × Respondio
+  const pvName = "pvCarreraRespondio";
+  const srcRange = tbl.getRange();
+  const pv = shResumen.addPivotTable(pvName, srcRange, shResumen.getRange("D1"));
+  pv.addRowHierarchy(pv.getHierarchy("Carrera"));
+  pv.addColumnHierarchy(pv.getHierarchy("Respondio"));
+  pv.addDataHierarchy(pv.getHierarchy("Respondio"));
+
+  shResumen.getRange("A1:B1").getFormat().getFill().setColor("#0B5F9A");
+  shResumen.getRange("A1:B1").getFormat().getFont().setColor("#FFFFFF");
+  shResumen.getRange("A1:B1").getFormat().getFont().setBold(true);
+  shResumen.getUsedRange()?.getFormat().autofitColumns();
+
+  // ======= HELPERS =======
+  function importSheetRobusto(
+    ws: ExcelScript.Worksheet, origen: string,
+    target: ExcelScript.Worksheet, startRow: number,
+    logWs: ExcelScript.Worksheet
+  ): number {
+    const ur = ws.getUsedRange();
+    if (!ur) { addLog(logWs, origen, 0, "Hoja vacía"); return startRow; }
+
+    const data = ur.getValues() as (string | number | boolean)[][];
+    const R = data.length, C = data[0]?.length ?? 0;
+
+    // 1) detectar encabezado
+    let headRow = -1;
+    for (let r = 0; r < Math.min(R, 25); r++) {
+      const rowText = data[r].map((v) => (v ?? "").toString().toLowerCase().trim());
+      const hits = countGroups(rowText, [
+        ["egresado", "nombre", "nombres"], ["paterno", "materno", "apellidos"],
+        ["carrera"], ["correo", "email"], ["periodo", "período", "semestre"], ["celular", "tel"],
+        ["control", "matrícula", "matricula", "no. control", "número de control", "numero de control", "id"]
+      ]);
+      const looksData = rowText.some((s) => s.includes("@")) || rowText.some((s) => /\d{8,}/.test(s));
+      if (hits >= 3 && !looksData) { headRow = r; break; }
+    }
+    if (headRow === -1) headRow = 0;
+
+    // 2) mapear / adivinar columnas
+    const head = data[headRow].map((v) => (v ?? "").toString().toLowerCase());
+    let iNom = find(head, ["egresado", "nombre", "nombre completo"]);
+    const iNoms = find(head, ["nombres", "nombre(s)", "nombre s"]);
+    const iPat = find(head, ["paterno", "ap. pat", "ape. pat", "apellido paterno"]);
+    const iMat = find(head, ["materno", "ap. mat", "ape. mat", "apellido materno"]);
+
+    // Nº de control (sinónimos amplios)
+    let iCtrl = find(head, [
+      "núm. de control", "num de control", "no. control", "no control", "número de control", "numero de control",
+      "matrícula", "matricula", "control", "id", "n° de control", "n° control"
+    ]);
+
+    let iSexo = find(head, ["sexo"]);
+    let iEdad = find(head, ["edad", "edad actual"]);
+    let iCarr = find(head, ["carrera", "programa"]);
+    let iPer = find(head, ["periodo", "período", "semestre", "egreso"]);
+    let iCP = find(head, ["correo personal", "personal"]);
+    let iCI = find(head, ["correo institucional", "instit", "correo itq"]);
+    let iCel = find(head, ["celular", "tel", "telefono", "teléfono"]);
+
+    if (iCP < 0 || iCI < 0) {
+      const emailCols = pickEmailColumns(data, headRow + 1, C);
+      if (iCP < 0 && emailCols[0] >= 0) iCP = emailCols[0];
+      if (iCI < 0 && emailCols[1] >= 0) iCI = emailCols[1];
+    }
+    if (iSexo < 0) iSexo = guessSexoColumn(data, headRow + 1, C);
+    if (iEdad < 0) iEdad = guessEdadColumn(data, headRow + 1, C);
+    if (iCtrl < 0) iCtrl = guessControlColumn(data, headRow + 1, C);
+    if (iCel < 0) iCel = guessCelColumn(data, headRow + 1, C);
+    if (iPer < 0) iPer = guessPeriodoColumn(data, headRow + 1, C);
+    if (iCarr < 0) iCarr = guessCarreraColumn(data, headRow + 1, C);
+    if (iNom < 0 && iNoms < 0) iNom = guessNombreColumn(data, headRow + 1, C, [iCP, iCI, iCtrl, iCel]);
+
+    const last = lastNonEmpty(data, headRow + 1, [iNom >= 0 ? iNom : iNoms, iCP, iCI]);
+    let imported = 0;
+
+    for (let r = headRow + 1; r <= last; r++) {
+      let nombre = "";
+      if (iNom >= 0) {
+        nombre = toTitle(clean(get(data, r, iNom)));
+      } else {
+        const nom = toTitle(clean(get(data, r, iNoms)));
+        const pat = toTitle(clean(get(data, r, iPat)));
+        const mat = toTitle(clean(get(data, r, iMat)));
+        nombre = [nom, pat, mat].filter((w) => !!w).join(" ").trim();
+      }
+
+      const correoP = normalizeEmail(get(data, r, iCP));
+      const correoI = normalizeEmail(get(data, r, iCI));
+      if (!nombre && !correoP && !correoI) continue;
+
+      // Nº de control robusto (o inferido del correo institucional)
+      const ctrlRaw = clean(get(data, r, iCtrl));
+      const numControl = buildNumControl(ctrlRaw, correoI);
+
+      // === NORMALIZAR PERIODO ===
+      const rawPeriodo = clean(get(data, r, iPer));
+      const periodoNorm = buildPeriodo(rawPeriodo, origen);
+
+      const row = [
+        nombre,
+        numControl,
+        normSexo(clean(get(data, r, iSexo))),
+        clean(get(data, r, iEdad)),
+        clean(get(data, r, iCarr)),
+        periodoNorm,                  // << valor uniforme (YYYY Ene-Jun / YYYY Ago-Dic)
+        correoP,
+        correoI,
+        clean(get(data, r, iCel)),
+        origen,
+        ""
+      ];
+      target.getRangeByIndexes(startRow - 1, 0, 1, row.length).setValues([row]);
+      startRow++; imported++;
+    }
+    addLog(logWs, origen, imported, imported === 0 ? "Columnas no reconocidas" : "");
+    return startRow;
+  }
+
+  // ------- detección por patrón -------
+  function pickEmailColumns(data: (string | number | boolean)[][], start: number, C: number): number[] {
+    const scores: number[] = new Array(C).fill(0);
+    for (let r = start; r < Math.min(start + 200, data.length); r++) {
+      for (let c = 0; c < C; c++) {
+        const s = (data[r][c] ?? "").toString().toLowerCase();
+        if (/@/.test(s)) scores[c]++;
+      }
+    }
+    const order = scores.map((v, i) => ({ v, i })).sort((a, b) => b.v - a.v).map(p => p.i);
+    return [order[0] ?? -1, order[1] ?? -1];
+  }
+  function guessSexoColumn(data: (string | number | boolean)[][], start: number, C: number): number {
+    let best = -1, sc = -1;
+    for (let c = 0; c < C; c++) {
+      let hit = 0, tot = 0;
+      for (let r = start; r < Math.min(start + 200, data.length); r++) {
+        const s = (data[r][c] ?? "").toString().trim().toLowerCase(); if (!s) continue;
+        tot++; if (s === "m" || s === "f" || /^m(asc|ale)?$/.test(s) || /^f(em|emina)?$/.test(s)) hit++;
+      }
+      const ratio = hit / (tot || 1);
+      if (hit > 0 && ratio > sc) { sc = ratio; best = c; }
+    }
+    return best;
+  }
+  function guessEdadColumn(data: (string | number | boolean)[][], start: number, C: number): number {
+    let best = -1, sc = -1;
+    for (let c = 0; c < C; c++) {
+      let hit = 0, tot = 0;
+      for (let r = start; r < Math.min(start + 200, data.length); r++) {
+        const s = (data[r][c] ?? "").toString().trim(); if (!s) continue; tot++;
+        const n = Number(s); if (!isNaN(n) && n >= 16 && n <= 80) hit++;
+      }
+      const ratio = hit / (tot || 1);
+      if (hit > 0 && ratio > sc) { sc = ratio; best = c; }
+    }
+    return best;
+  }
+  function guessControlColumn(data: (string | number | boolean)[][], start: number, C: number): number {
+    // permite letra opcional y 8–10 dígitos, ignora separadores
+    let best = -1, sc = -1;
+    for (let c = 0; c < C; c++) {
+      let hit = 0, tot = 0;
+      for (let r = start; r < Math.min(start + 200, data.length); r++) {
+        let s = (data[r][c] ?? "").toString().trim();
+        if (!s) continue; tot++;
+        const sClean = s.replace(/[^A-Za-z0-9]/g, "");
+        if (/^[A-Za-z]?\d{8,10}$/.test(sClean)) hit++;
+      }
+      const ratio = hit / (tot || 1);
+      if (hit > 0 && ratio > sc) { sc = ratio; best = c; }
+    }
+    return best;
+  }
+  function guessCelColumn(data: (string | number | boolean)[][], start: number, C: number): number {
+    let best = -1, sc = -1;
+    for (let c = 0; c < C; c++) {
+      let hit = 0, tot = 0;
+      for (let r = start; r < Math.min(start + 200, data.length); r++) {
+        const s = (data[r][c] ?? "").toString().replace(/\D/g, ""); if (!s) continue; tot++;
+        if (s.length >= 9 && s.length <= 12) hit++;
+      }
+      const ratio = hit / (tot || 1);
+      if (hit > 0 && ratio > sc) { sc = ratio; best = c; }
+    }
+    return best;
+  }
+  function guessPeriodoColumn(data: (string | number | boolean)[][], start: number, C: number): number {
+    const re = /(ene|feb|mar|abr|may|jun|ago|sep|oct|nov|dic|202\d)/i;
+    let best = -1, sc = -1;
+    for (let c = 0; c < C; c++) {
+      let hit = 0, tot = 0;
+      for (let r = start; r < Math.min(start + 200, data.length); r++) {
+        const s = (data[r][c] ?? "").toString(); if (!s) continue; tot++; if (re.test(s)) hit++;
+      }
+      const ratio = hit / (tot || 1);
+      if (hit > 0 && ratio > sc) { sc = ratio; best = c; }
+    }
+    return best;
+  }
+  function guessCarreraColumn(data: (string | number | boolean)[][], start: number, C: number): number {
+    const re = /(ing|lic|arqu|admin|maes|quim|civil|sistemas|industrial)/i;
+    let best = -1, sc = -1;
+    for (let c = 0; c < C; c++) {
+      let hit = 0, tot = 0;
+      for (let r = start; r < Math.min(start + 200, data.length); r++) {
+        const s = (data[r][c] ?? "").toString(); if (!s) continue; tot++; if (re.test(s)) hit++;
+      }
+      const ratio = hit / (tot || 1);
+      if (hit > 0 && ratio > sc) { sc = ratio; best = c; }
+    }
+    return best;
+  }
+  function guessNombreColumn(
+    data: (string | number | boolean)[][], start: number, C: number, exclude: number[]
+  ): number {
+    let best = -1, sc = -1;
+    for (let c = 0; c < C; c++) {
+      if (exclude.indexOf(c) >= 0) continue;
+      let letters = 0, rows = 0, emails = 0;
+      for (let r = start; r < Math.min(start + 200, data.length); r++) {
+        const s = (data[r][c] ?? "").toString();
+        if (!s) continue; rows++;
+        if (/@/.test(s)) emails++;
+        const mm = s.match(/[A-Za-zÁÉÍÓÚáéíóúñÑ]/g);
+        letters += mm ? mm.length : 0;
+      }
+      if (rows > 0 && emails / rows < 0.05) {
+        const score = letters / (rows || 1);
+        if (score > sc) { sc = score; best = c; }
+      }
+    }
+    return best;
+  }
+
+  // utilidades comunes
+  function countGroups(row: string[], groups: string[][]): number {
+    let hits = 0;
+    for (const g of groups) {
+      let found = false;
+      for (const h of row) {
+        for (const k of g) if (h.includes(k)) { found = true; break; }
+        if (found) break;
+      }
+      if (found) hits++;
+    }
+    return hits;
+  }
+  function addLog(ws: ExcelScript.Worksheet, hoja: string, n: number, obs: string) {
+    const ur = ws.getUsedRange();
+    const next = (ur ? ur.getRowCount() : 1) + 1;
+    ws.getRange(`A${next}:C${next}`).setValues([[hoja, n, obs]]);
+  }
+  function collectResponded(sh?: ExcelScript.Worksheet): Set<string> {
+    const set = new Set<string>(); if (!sh) return set;
+    const ur = sh.getUsedRange(); if (!ur || ur.getRowCount() < 2) return set;
+
+    const vals = ur.getValues() as (string | number | boolean)[][];
+    const R = vals.length, C = vals[0]?.length ?? 0;
+
+    for (let r = 1; r < R; r++) {
+      for (let c = 0; c < C; c++) {
+        const raw = (vals[r][c] ?? "").toString();
+        const norm = normalizeEmail(raw);
+        if (norm && /@/.test(norm)) set.add(norm);
+      }
+    }
+    return set;
+  }
+  function find(header: string[], keys: string[]): number {
+    for (let i = 0; i < header.length; i++) {
+      const h = (header[i] ?? "").toString().toLowerCase().trim();
+      for (let k = 0; k < keys.length; k++) if (h.includes(keys[k])) return i;
+    }
+    return -1;
+  }
+  function get(data: (string | number | boolean)[][], r: number, c: number): string {
+    if (c < 0) return ""; return (data[r]?.[c] ?? "").toString();
+  }
+  function lastNonEmpty(data: (string | number | boolean)[][], start: number, keyCols: number[]): number {
+    for (let r = data.length - 1; r >= start; r--) {
+      let ok = false;
+      for (let i = 0; i < keyCols.length; i++) {
+        const c = keyCols[i];
+        if (c >= 0) { const v = (data[r]?.[c] ?? "").toString().trim(); if (v) { ok = true; break; } }
+      }
+      if (ok) return r;
+    }
+    return start - 1;
+  }
+  function clean(v: unknown): string {
+    const s = (v === null || v === undefined) ? "" : String(v);
+    return s.replace(/[\r\n\t]/g, " ").replace(/[|#]+/g, " ").replace(/\s{2,}/g, " ").trim();
+  }
+  function toTitle(raw: string): string {
+    const s = clean(raw).toLowerCase(); if (!s) return "";
+    const keep = new Set(["de", "del", "la", "las", "los", "y", "e", "da", "dos", "das"]);
+    const parts = s.split(" ");
+    for (let i = 0; i < parts.length; i++) {
+      const w = parts[i]; if (i > 0 && keep.has(w)) continue;
+      parts[i] = w.charAt(0).toUpperCase() + w.slice(1);
+    }
+    return parts.join(" ");
+  }
+  function normSexo(v: string): string {
+    const s = clean(v).toLowerCase(); if (!s) return "";
+    if (s === "m" || /^m(asc|ale)?$/.test(s) || s.startsWith("m")) return "M";
+    if (s === "f" || /^f(em|emina)?$/.test(s) || s.startsWith("f")) return "F";
+    return s.toUpperCase();
+  }
+  function normalizeEmail(v: unknown): string {
+    const s0 = (v === null || v === undefined) ? "" : String(v);
+    const m = s0.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    const s1 = (m ? m[0] : s0).toLowerCase();
+    return s1.replace(/\s+/g, "").trim();
+  }
+  function buildNumControl(ctrlRaw: string, correoInst: string): string {
+    let s = (ctrlRaw || "").replace(/[^A-Za-z0-9]/g, "");
+    if (/^[A-Za-z]?\d{8,10}$/.test(s)) return s.toUpperCase();
+    const m = (correoInst || "").match(/^([A-Za-z]?\d{8,10})@/i);
+    if (m) return m[1].toUpperCase();
+    const m2 = (correoInst || "").match(/([A-Za-z]?\d{8,10})/i);
+    if (m2) return m2[1].toUpperCase();
+    return s.toUpperCase();
+  }
+
+  // ====== NUEVO: normalización de PERIODO ======
+  function buildPeriodo(rawPeriodo: string, origenHoja: string): string {
+    const p = (rawPeriodo || "").trim();
+    const sem = semesterOf(p);               // "Ene-Jun" | "Ago-Dic" | "Sin periodo"
+    const yearFromCell = extractYear(p);
+    const yearFromSheet = extractYear(origenHoja);
+    const yyyy = yearFromCell || yearFromSheet;
+
+    if (sem === "Sin periodo" && !yyyy) return "Sin periodo";
+    if (yyyy && (sem === "Ene-Jun" || sem === "Ago-Dic")) return `${yyyy} ${sem}`;
+    if (sem === "Ene-Jun" || sem === "Ago-Dic") return sem;
+    return "Sin periodo";
+  }
+  function extractYear(s: string): string {
+    const m = (s || "").match(/(20\d{2})/);
+    return m ? m[1] : "";
+  }
+  function semesterOf(texto: string): string {
+    const t = (texto || "").toLowerCase();
+    const hasEJ = /(ene|jan|feb|mar|abr|apr|may|jun)/.test(t);
+    const hasAD = /(ago|aug|sep|oct|nov|dic|dec)/.test(t);
+    if (hasEJ && !hasAD) return "Ene-Jun";
+    if (hasAD && !hasEJ) return "Ago-Dic";
+    const posEJ = t.search(/ene|jan|feb|mar|abr|apr|may|jun/);
+    const posAD = t.search(/ago|aug|sep|oct|nov|dic|dec/);
+    if (posEJ !== -1 && (posAD === -1 || posEJ < posAD)) return "Ene-Jun";
+    if (posAD !== -1) return "Ago-Dic";
+    return "Sin periodo";
+  }
+}
