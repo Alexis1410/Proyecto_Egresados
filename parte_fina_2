@@ -1,0 +1,327 @@
+function main(workbook: ExcelScript.Workbook) {
+  // ========= CONFIG =========
+  const DATA_SHEET = "Base Maestra";
+
+  // ========= VALIDACIONES =========
+  const shData = workbook.getWorksheet(DATA_SHEET);
+  if (!shData) throw new Error(`No existe la hoja '${DATA_SHEET}'. Ejecuta primero el script que crea la Base Maestra.`);
+
+  const used = shData.getUsedRange();
+  if (!used || used.getRowCount() < 2) throw new Error(`'${DATA_SHEET}' no tiene datos suficientes.`);
+
+  const vals: (string | number | boolean)[][] = used.getValues();
+  const header: string[] = vals[0].map(v => (v ?? "").toString().trim());
+
+  // Columnas (aceptamos sinónimos)
+  const idxOrigenHoja = findColAny(header, ["OrigenHoja", "Hoja origen", "Origen"]);
+  const idxRespondio = findColAny(header, ["Respondio", "Respondió", "Respondido", "Estado"]);
+  const idxPeriodo = findColAny(header, ["Periodo", "Periodo de egreso", "Periodo egreso"]);
+  const idxCarrera = findColAny(header, ["Carrera", "Programa", "Carrera/Programa"]);
+  const idxSexo = findColAny(header, ["Sexo", "Género", "Genero"]);
+  const idxModalidad = findColAny(header, ["Modalidad", "Esquema", "TipoPrograma", "Tipo", "Programa modalidad", "Régimen", "Regimen"]);
+
+  if (idxOrigenHoja === -1 || idxRespondio === -1 || idxPeriodo === -1) {
+    throw new Error("Faltan columnas requeridas en 'Base Maestra': 'OrigenHoja', 'Respondio' y 'Periodo/Periodo de egreso'.");
+  }
+
+  // ========= CREAR HOJA DE SALIDA (estética) =========
+  const shOut = addSheetSafe(workbook, `Resumen_${timeSuffix()}`);
+  let nextRow = 1;
+
+  // Título
+  putTitle(shOut, nextRow, "RESUMEN DE EGRESADOS"); nextRow += 2;
+
+  // ========= ACUMULADOS =========
+  type CountRec = { total: number; resp: number; no: number };
+  const perHoja: { [k: string]: CountRec } = {};
+  const perSem: { [key: string]: { anio: string; sem: string; total: number; resp: number; no: number } } = {};
+  const perCarr: { [carrera: string]: CountRec } = {};
+  const perSexo: { [sexo: string]: CountRec } = {};
+  const perMod: { [mod: string]: CountRec } = {};
+
+  let total = 0, resp = 0, no = 0;
+
+  for (let r = 1; r < vals.length; r++) {
+    const origen = str(vals[r][idxOrigenHoja]) || "(Sin origen)";
+    const responded = isResponded(vals[r][idxRespondio]);
+    const periodo = str(vals[r][idxPeriodo]);
+    const carrera = idxCarrera >= 0 ? (str(vals[r][idxCarrera]) || "(Sin carrera)") : "(Sin carrera)";
+    const sexoNorm = normalizeSexo(idxSexo >= 0 ? str(vals[r][idxSexo]) : "");
+    const modNorm = normalizeModalidad(idxModalidad >= 0 ? str(vals[r][idxModalidad]) : "");
+
+    addAgg(perHoja, origen, responded);
+
+    const { anio, sem } = parseSemester(periodo);
+    const kSem = `${anio}|||${sem}`;
+    if (!perSem[kSem]) perSem[kSem] = { anio, sem, total: 0, resp: 0, no: 0 };
+    perSem[kSem].total++; responded ? perSem[kSem].resp++ : perSem[kSem].no++;
+
+    addAgg(perCarr, carrera, responded);
+    addAgg(perSexo, sexoNorm, responded);
+    addAgg(perMod, modNorm, responded);
+
+    total++; responded ? resp++ : no++;
+  }
+
+  // ========= TABLAS (con estilo) =========
+  // 1) Global
+  putSubtitle(shOut, nextRow, "Resumen global"); nextRow++;
+  nextRow = putTable(shOut, nextRow,
+    ["Métrica", "Valor"],
+    [
+      ["Total registros", total],
+      ["Respondieron", resp],
+      ["No respondieron", no],
+    ],
+    0 /*sin col %*/) + 1;
+
+  // 2) Por semestre
+  putSubtitle(shOut, nextRow, "Por semestre"); nextRow++;
+  const semRows: (string | number)[][] = Object.values(perSem)
+    .map(rec => [rec.anio, rec.sem, rec.total, rec.resp, rec.no, pct(rec.resp, rec.total)])
+    .sort((a, b) => {
+      const ay = parseInt(a[0] as string || "0", 10);
+      const by = parseInt(b[0] as string || "0", 10);
+      if (by !== ay) return by - ay;
+      const order = (s: string) => s === "Ene-Jun" ? 0 : (s === "Ago-Dic" ? 1 : 2);
+      return order(a[1] as string) - order(b[1] as string);
+    });
+  nextRow = putTable(shOut, nextRow,
+    ["Año", "Semestre", "Total", "Respondieron", "No respondieron", "% Respuesta"],
+    semRows,
+    6 /*col %*/) + 1;
+
+  // 3) Por carrera
+  putSubtitle(shOut, nextRow, "Por carrera"); nextRow++;
+  const carrRows: (string | number)[][] = toRows(perCarr);
+  nextRow = putTable(shOut, nextRow,
+    ["Carrera", "Total", "Respondieron", "No respondieron", "% Respuesta"],
+    carrRows,
+    5) + 1;
+
+  // 4) Por sexo
+  putSubtitle(shOut, nextRow, "Por sexo"); nextRow++;
+  const sexoRows: (string | number)[][] = toRows(perSexo);
+  nextRow = putTable(shOut, nextRow,
+    ["Sexo", "Total", "Respondieron", "No respondieron", "% Respuesta"],
+    sexoRows,
+    5) + 1;
+
+  // 5) Por modalidad
+  putSubtitle(shOut, nextRow, "Por modalidad"); nextRow++;
+  const modRows: (string | number)[][] = toRows(perMod);
+  nextRow = putTable(shOut, nextRow,
+    ["Modalidad", "Total", "Respondieron", "No respondieron", "% Respuesta"],
+    modRows,
+    5) + 2;
+
+  // 6) Referencial: por hoja origen
+  putSubtitle(shOut, nextRow, "Por hoja origen"); nextRow++;
+  const hojaRows: (string | number)[][] = toRows(perHoja);
+  nextRow = putTable(shOut, nextRow,
+    ["Hoja origen", "Total", "Respondieron", "No respondieron", "% Respuesta"],
+    hojaRows,
+    5) + 2;
+
+  // ========= GRÁFICAS =========
+  if (semRows.length > 0) {
+    const start = nextRow;
+    shOut.getRange(`A${start}:B${start}`).setValues([["Semestre", "Total"]]);
+    const comp: (string | number)[][] = semRows.map(r => [`${r[0]} ${r[1]}`, r[2]]);
+    shOut.getRangeByIndexes(start, 0, comp.length, 2).setValues(comp);
+    const ch1 = shOut.addChart(ExcelScript.ChartType.columnClustered, shOut.getRangeByIndexes(start - 1, 0, comp.length + 1, 2));
+    ch1.getTitle().setText("Totales por semestre");
+    ch1.getLegend().setVisible(false);
+    ch1.setPosition(shOut.getRange(`H2`), shOut.getRange(`P18`));
+    nextRow = start + comp.length + 2;
+  }
+
+  if (carrRows.length > 0) {
+    const top = carrRows.slice(0, Math.min(20, carrRows.length));
+    const start = nextRow;
+    shOut.getRange(`A${start}:B${start}`).setValues([["Carrera", "Total"]]);
+    const cdata: (string | number)[][] = top.map(r => [r[0], r[1]]);
+    shOut.getRangeByIndexes(start, 0, cdata.length, 2).setValues(cdata);
+    const ch2 = shOut.addChart(ExcelScript.ChartType.columnClustered, shOut.getRangeByIndexes(start - 1, 0, cdata.length + 1, 2));
+    ch2.getTitle().setText("Totales por carrera");
+    ch2.getLegend().setVisible(false);
+    ch2.setPosition(shOut.getRange(`H20`), shOut.getRange(`P36`));
+    nextRow = start + cdata.length + 2;
+  }
+
+  const startPie = nextRow;
+  shOut.getRange(`A${startPie}:B${startPie}`).setValues([["Estado", "Total"]]);
+  shOut.getRange(`A${startPie + 1}:B${startPie + 2}`).setValues([["Respondieron", resp], ["No respondieron", no]]);
+  const pie = shOut.addChart(ExcelScript.ChartType.pie, shOut.getRangeByIndexes(startPie - 1, 0, 3, 2));
+  pie.getTitle().setText("Distribución global");
+  pie.getLegend().setVisible(true);
+  pie.setPosition(shOut.getRange(`H38`), shOut.getRange(`P54`));
+
+  // ========= FORMATO GENERAL =========
+  const usedOut = shOut.getUsedRange();
+  if (usedOut) {
+    usedOut.getFormat().getFont().setName("Calibri");
+    usedOut.getFormat().getFont().setSize(11);
+    usedOut.getFormat().setVerticalAlignment(ExcelScript.VerticalAlignment.center);
+    usedOut.getFormat().autofitColumns();
+    usedOut.getFormat().autofitRows();
+  }
+
+  // ===== Helpers (solo tipos primitivos; sin devolver objetos de API) =====
+  function str(v: unknown): string { return (v ?? "").toString().trim(); }
+  function pct(a: number, t: number): number { return t ? a / t : 0; }
+
+  function addAgg(agg: { [k: string]: CountRec }, k: string, responded: boolean) {
+    if (!agg[k]) agg[k] = { total: 0, resp: 0, no: 0 };
+    agg[k].total++; responded ? agg[k].resp++ : agg[k].no++;
+  }
+
+  function toRows(o: { [k: string]: CountRec }): (string | number)[][] {
+    return Object.entries(o)
+      .map(([k, h]) => [k, h.total, h.resp, h.no, pct(h.resp, h.total)])
+      .sort((a, b) => (b[1] as number) - (a[1] as number));
+  }
+
+  function findColAny(headers: string[], names: string[]): number {
+    const lower = headers.map(h => (h ?? "").toString().trim().toLowerCase());
+    for (let i = 0; i < lower.length; i++) {
+      for (const n of names) if (lower[i] === n.toLowerCase()) return i;
+    }
+    return -1;
+  }
+
+  function parseSemester(periodo: string): { anio: string, sem: string } {
+    const p = (periodo || "").toLowerCase();
+    let anio = "";
+    const m = p.match(/(20\d{2})/); if (m) anio = m[1];
+    const hasEJ = /(ene|feb|mar|abr|may|jun|jan|feb|mar|apr|may|jun)/.test(p);
+    const hasAD = /(ago|sep|set|oct|nov|dic|aug|sep|oct|nov|dec)/.test(p);
+    let sem = "";
+    if (hasEJ && !hasAD) sem = "Ene-Jun";
+    else if (hasAD && !hasEJ) sem = "Ago-Dic";
+    else if (hasEJ && hasAD) {
+      const posEJ = p.search(/ene|feb|mar|abr|may|jun|jan|feb|mar|apr|may|jun/);
+      const posAD = p.search(/ago|sep|set|oct|nov|dic|aug|sep|oct|nov|dec/);
+      sem = (posEJ !== -1 && (posAD === -1 || posEJ < posAD)) ? "Ene-Jun" : "Ago-Dic";
+    } else { sem = "Sin periodo"; }
+    return { anio, sem };
+  }
+
+  function isResponded(val: unknown): boolean {
+    const s = str(val).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    if (!s) return false;
+    if (s.includes("no") && s.includes("respond")) return false;
+    return s.includes("respond");
+  }
+
+  function normalizeSexo(v: string): string {
+    const s = (v || "").trim().toLowerCase();
+    if (!s) return "(Sin sexo)";
+    if (s.startsWith("m")) return "M";
+    if (s.startsWith("f")) return "F";
+    return "Otro";
+  }
+
+  // Limpia saltos de línea y mapea modalidad (Presencial / Semipresencial / En línea / Otra)
+  function normalizeModalidad(v: string): string {
+    const s = (v || "")
+      .replace(/[\r\n]+/g, " ") // convierte ALT+ENTER en espacios
+      .replace(/\s+/g, " ")
+      .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase().trim();
+
+    if (!s) return "(Sin modalidad)";
+    if (s.includes("presencial a distancia") || s.includes("semi") || s.includes("mixta") || s.includes("hibrid") || s.includes("dual"))
+      return "Semipresencial";
+    if (s.includes("presenc")) return "Presencial";
+    if (s.includes("linea") || s.includes("virtual") || s.includes("distancia") || s.includes("online"))
+      return "En línea";
+    return "Otra";
+  }
+
+  // Crea tabla con estilo; si pctColIndex > 0, aplica formato % a esa columna (1-based)
+  function putTable(
+    ws: ExcelScript.Worksheet,
+    startRow: number,
+    headers: string[],
+    rows: (string | number)[][],
+    pctColIndex: number
+  ): number {
+    if (rows.length === 0) {
+      ws.getRange(`A${startRow}`).setValue("(sin datos)");
+      return startRow + 1;
+    }
+    ws.getRangeByIndexes(startRow - 1, 0, 1, headers.length).setValues([headers]);
+    ws.getRangeByIndexes(startRow, 0, rows.length, headers.length).setValues(rows);
+    const table = ws.addTable(ws.getRangeByIndexes(startRow - 1, 0, rows.length + 1, headers.length), true);
+    table.setPredefinedTableStyle("TableStyleMedium2");
+
+    // Zebra y autofit
+    const body = table.getRangeBetweenHeaderAndTotal();
+    const cfEven = body.addConditionalFormat(ExcelScript.ConditionalFormatType.custom);
+    cfEven.getCustom().getRule().setFormula("=ISEVEN(ROW())");
+    cfEven.getCustom().getFormat().getFill().setColor("#F7FBFF");
+
+    const usedTbl = table.getRange();
+    usedTbl.getFormat().autofitColumns();
+    usedTbl.getFormat().autofitRows();
+
+    // Porcentaje
+    if (pctColIndex > 0) {
+      const cols = table.getColumns();
+      const idx = pctColIndex - 1;
+      if (idx >= 0 && idx < cols.length) {
+        cols[idx].getRangeBetweenHeaderAndTotal().setNumberFormatLocal("0.0%");
+      }
+    }
+    return startRow + rows.length + 1;
+  }
+
+  function putTitle(ws: ExcelScript.Worksheet, row: number, text: string) {
+    const rg = ws.getRange(`A${row}:F${row}`);
+    rg.merge(); rg.setValue(text);
+    const fmt = rg.getFormat();
+    fmt.getFont().setBold(true);
+    fmt.getFont().setSize(16);
+    fmt.getFill().setColor("#1F4E79");
+    fmt.getFont().setColor("#FFFFFF");
+    fmt.setHorizontalAlignment(ExcelScript.HorizontalAlignment.center);
+  }
+
+  function putSubtitle(ws: ExcelScript.Worksheet, row: number, text: string) {
+    const rg = ws.getRange(`A${row}:F${row}`);
+    rg.merge(); rg.setValue(text);
+    const fmt = rg.getFormat();
+    fmt.getFont().setBold(true);
+    fmt.getFill().setColor("#EAF4FF");
+    fmt.setHorizontalAlignment(ExcelScript.HorizontalAlignment.left);
+  }
+
+  function addSheetSafe(wb: ExcelScript.Workbook, desiredName: string): ExcelScript.Worksheet {
+    const name = sanitizeSheetName(desiredName);
+    let finalName = name, i = 2;
+    while (wb.getWorksheet(finalName)) {
+      const base = name.length > 28 ? name.substring(0, 28) : name;
+      finalName = `${base}_${i++}`;
+    }
+    return wb.addWorksheet(finalName);
+  }
+
+  function sanitizeSheetName(n: string): string {
+    let s = n.replace(/[:\\/?*\[\]]/g, "");
+    if (s.length > 31) s = s.substring(0, 31);
+    if (s.trim() === "") s = "Resumen";
+    return s;
+  }
+
+  function timeSuffix(): string {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = (now.getMonth() + 1).toString().padStart(2, "0");
+    const d = now.getDate().toString().padStart(2, "0");
+    const hh = now.getHours().toString().padStart(2, "0");
+    const mm = now.getMinutes().toString().padStart(2, "0");
+    const ss = now.getSeconds().toString().padStart(2, "0");
+    return `${y}${m}${d}-${hh}${mm}${ss}`;
+  }
+}
