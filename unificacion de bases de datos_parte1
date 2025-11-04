@@ -1,0 +1,288 @@
+function main(workbook: ExcelScript.Workbook) {
+    const SH23 = "Egresados 2023";
+    const SH24 = "Egresados 2024";
+    const SHRESP = "Respondieron";
+    const OUT = "Base Maestra";
+    const LOG = "Resumen Importación";
+
+    const sh23 = workbook.getWorksheet(SH23);
+    const sh24 = workbook.getWorksheet(SH24);
+
+    if (!sh23 && !sh24) {
+        throw new Error(`No se encontraron hojas '${SH23}' ni '${SH24}'.`);
+    }
+
+    // Limpia/crea salida
+    let shOut = workbook.getWorksheet(OUT);
+    if (shOut) shOut.delete();
+    shOut = workbook.addWorksheet(OUT);
+
+    // Limpia/crea log
+    let shLog = workbook.getWorksheet(LOG);
+    if (shLog) shLog.delete();
+    shLog = workbook.addWorksheet(LOG);
+    shLog.getRange("A1:B1").setValues([["Hoja origen", "Filas importadas"]]);
+
+    // Encabezados estándar (ya sin EmailClave, Anio, Formulario)
+    const headers: string[] = [
+        "Nombre", "NumControl", "Sexo", "Edad", "Carrera", "Periodo",
+        "CorreoPersonal", "CorreoInstitucional", "Celular",
+        "OrigenHoja", "Respondio"
+    ];
+    shOut.getRange("A1").getResizedRange(0, headers.length - 1).setValues([headers]);
+
+    // Importa de cada hoja
+    let nextRow = 2;
+    if (sh23) nextRow = appendFromArbitrarySheet(sh23, "Egresados 2023", shOut, nextRow, shLog);
+    if (sh24) nextRow = appendFromArbitrarySheet(sh24, "Egresados 2024", shOut, nextRow, shLog);
+
+    if (nextRow === 2) {
+        throw new Error("No se importó ninguna fila desde las hojas de egresados.");
+    }
+
+    // ===== Marcar Respondio según hoja RESPONDIERON =====
+    const respondedSet = loadRespondedEmails(workbook.getWorksheet(SHRESP));
+    const used2 = shOut.getUsedRange();
+    const vals2 = used2.getValues();
+    for (let r = 1; r < vals2.length; r++) {
+        const cp = (vals2[r][6] ?? "").toString().trim().toLowerCase();
+        const ci = (vals2[r][7] ?? "").toString().trim().toLowerCase();
+        const match = (cp && respondedSet.has(cp)) || (ci && respondedSet.has(ci));
+        vals2[r][10] = match ? "Respondió" : "No respondió"; // col 11 (índice 10)
+    }
+    used2.setValues(vals2);
+
+    // Crear tabla
+    const lastRow = shOut.getUsedRange()!.getRowCount();
+    const lastCol = headers.length;
+    const tbl = shOut.addTable(shOut.getRangeByIndexes(0, 0, lastRow, lastCol), true);
+    tbl.setName("tblBaseMaestra");
+    tbl.setPredefinedTableStyle("TableStyleMedium2");
+
+    // Estética
+    shOut.getFreezePanes().freezeRows(1);
+    const headerRow = shOut.getRange("A1:K1");
+    headerRow.getFormat().getFont().setBold(true);
+    headerRow.getFormat().setHorizontalAlignment(ExcelScript.HorizontalAlignment.center);
+    shOut.getUsedRange()!.getFormat().autofitColumns();
+    shOut.getUsedRange()!.getFormat().autofitRows();
+
+    // Selecciona la tabla al finalizar
+    tbl.getRange().select();
+
+    // =================== RESUMEN DETALLADO + GRÁFICAS ===================
+    buildImportSummaryAndCharts(shOut, shLog);
+
+    // =================== Helpers ===================
+
+    function buildImportSummaryAndCharts(shData: ExcelScript.Worksheet, shSummary: ExcelScript.Worksheet) {
+        const ur = shSummary.getUsedRange();
+        if (ur) ur.clear(ExcelScript.ClearApplyTo.all);
+
+        shSummary.getRange("A1:E1").setValues([["Hoja origen", "Total", "Respondieron", "No respondieron", "% Respuesta"]]);
+        shSummary.getRange("A1:E1").getFormat().getFont().setBold(true);
+
+        const data = shData.getUsedRange().getValues();
+        if (!data || data.length < 2) return;
+
+        const IDX_ORIGEN = 9;   // OrigenHoja
+        const IDX_RESP = 10;    // Respondio
+
+        const perHoja: { [k: string]: { total: number; resp: number; no: number } } = {};
+        let total = 0, resp = 0, no = 0;
+
+        for (let r = 1; r < data.length; r++) {
+            const origen = (data[r][IDX_ORIGEN] ?? "").toString().trim();
+            const responded = (data[r][IDX_RESP] ?? "").toString().trim() === "Respondió";
+
+            if (!perHoja[origen]) perHoja[origen] = { total: 0, resp: 0, no: 0 };
+            perHoja[origen].total++;
+            total++;
+
+            if (responded) {
+                perHoja[origen].resp++;
+                resp++;
+            } else {
+                perHoja[origen].no++;
+                no++;
+            }
+        }
+
+        const keys = Object.keys(perHoja);
+        const rows: (string | number)[][] = [];
+        for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            const h = perHoja[k];
+            const pct = h.total ? (h.resp / h.total) : 0;
+            rows.push([k, h.total, h.resp, h.no, pct]);
+        }
+        rows.sort((a, b) => (b[1] as number) - (a[1] as number));
+        if (rows.length > 0) {
+            shSummary.getRangeByIndexes(1, 0, rows.length, 5).setValues(rows);
+            shSummary.getRangeByIndexes(1, 4, rows.length, 1).setNumberFormatLocal("0.0%");
+        }
+
+        const baseRow = rows.length + 3;
+        shSummary.getRange(`A${baseRow}`).setValue("Resumen global");
+        shSummary.getRange(`A${baseRow}`).getFormat().getFont().setBold(true);
+        shSummary.getRange(`A${baseRow + 1}:B${baseRow + 3}`).setValues([
+            ["Total registros", total],
+            ["Respondieron", resp],
+            ["No respondieron", no]
+        ]);
+        shSummary.getUsedRange().getFormat().autofitColumns();
+
+        // Gráficas
+        if (rows.length > 0) {
+            const dataRange1 = shSummary.getRangeByIndexes(0, 0, rows.length + 1, 4);
+            const chart1 = shSummary.addChart(ExcelScript.ChartType.columnClustered, dataRange1);
+            chart1.setPlotBy(ExcelScript.ChartPlotBy.columns);
+            chart1.getTitle().setText("Respondieron vs No por hoja");
+            chart1.getLegend().setVisible(true);
+            chart1.setPosition(shSummary.getRange(`G1`), shSummary.getRange(`N16`));
+        }
+
+        const pieData = shSummary.getRangeByIndexes(baseRow + 1, 0, 2, 2);
+        const chart2 = shSummary.addChart(ExcelScript.ChartType.pie, pieData);
+        chart2.getTitle().setText("Distribución global: Respondieron vs No");
+        chart2.getLegend().setVisible(true);
+        chart2.setPosition(shSummary.getRange(`G18`), shSummary.getRange(`N33`));
+
+        const usedSum = shSummary.getUsedRange();
+        usedSum.getFormat().getFont().setName("Calibri");
+        usedSum.getFormat().getFont().setSize(11);
+        usedSum.getFormat().setVerticalAlignment(ExcelScript.VerticalAlignment.center);
+    }
+
+    function appendFromArbitrarySheet(
+        ws: ExcelScript.Worksheet,
+        origen: string,
+        target: ExcelScript.Worksheet,
+        startRow: number,
+        logSheet: ExcelScript.Worksheet
+    ): number {
+        const ur = ws.getUsedRange();
+        if (!ur) {
+            logSheet.getRange(`A${logSheet.getUsedRange()?.getRowCount() + 1 ?? 2}:B${logSheet.getUsedRange()?.getRowCount() + 1 ?? 2}`)
+                .setValues([[origen, 0]]);
+            return startRow;
+        }
+        const data: (string | number | boolean)[][] = ur.getValues();
+        const rowCount = data.length;
+
+        const mustHaveGroups: string[][] = [
+            ["egresado", "nombre"],
+            ["carrera"],
+            ["correo", "email"],
+            ["periodo", "período"],
+            ["celular", "tel"],
+            ["control"]
+        ];
+        let headerRowIndex = -1;
+        for (let r = 0; r < Math.min(rowCount, 20); r++) {
+            const rowLower: string[] = data[r].map(v => (v ?? "").toString().toLowerCase().trim());
+            let hits = 0;
+            for (const group of mustHaveGroups) {
+                if (rowLower.some(h => group.some(g => h.includes(g)))) hits++;
+            }
+            if (hits >= 3) { headerRowIndex = r; break; }
+        }
+        if (headerRowIndex === -1) headerRowIndex = 0;
+
+        const headerRow: string[] = data[headerRowIndex].map(v => (v ?? "").toString().toLowerCase());
+
+        const iNombre = findIndex(headerRow, ["egresado", "nombre"]);
+        const iNum = findIndex(headerRow, ["núm.", "num", "control"]);
+        const iSexo = findIndex(headerRow, ["sexo"]);
+        const iEdad = findIndex(headerRow, ["edad"]);
+        const iCarr = findIndex(headerRow, ["carrera"]);
+        const iPer = findIndex(headerRow, ["periodo", "período"]);
+        const iCP = findIndex(headerRow, ["correo personal", "personal"]);
+        const iCI = findIndex(headerRow, ["correo institucional", "instit"]);
+        const iCel = findIndex(headerRow, ["celular", "tel"]);
+
+        let imported = 0;
+        const lastDataRow = lastNonEmptyRow(data, headerRowIndex + 1, [iNombre, iCP, iCI]);
+
+        for (let r = headerRowIndex + 1; r <= lastDataRow; r++) {
+            const nombre = getCell(data, r, iNombre);
+            const correoP = getCell(data, r, iCP).toLowerCase();
+            const correoI = getCell(data, r, iCI).toLowerCase();
+            if (!nombre && !correoP && !correoI) continue;
+
+            const row: (string | number)[] = [
+                nombre,
+                getCell(data, r, iNum),
+                getCell(data, r, iSexo),
+                getCell(data, r, iEdad),
+                getCell(data, r, iCarr),
+                getCell(data, r, iPer),
+                correoP,
+                correoI,
+                getCell(data, r, iCel),
+                origen,
+                "" // Respondio
+            ];
+            target.getRangeByIndexes(startRow - 1, 0, 1, row.length).setValues([row]);
+            startRow++;
+            imported++;
+        }
+
+        const logLast = shLog.getUsedRange()?.getRowCount() ?? 1;
+        shLog.getRange(`A${logLast + 1}:B${logLast + 1}`).setValues([[origen, imported]]);
+        return startRow;
+    }
+
+    function findIndex(headerRow: string[], needles: string[]): number {
+        for (let i = 0; i < headerRow.length; i++) {
+            const h = (headerRow[i] ?? "").toString().toLowerCase().trim();
+            for (const n of needles) {
+                if (h.includes(n)) return i;
+            }
+        }
+        return -1;
+    }
+
+    function getCell(data: (string | number | boolean)[][], r: number, c: number): string {
+        if (c < 0) return "";
+        return (data[r]?.[c] ?? "").toString().trim();
+    }
+
+    function lastNonEmptyRow(
+        data: (string | number | boolean)[][],
+        start: number,
+        keyCols: number[]
+    ): number {
+        for (let r = data.length - 1; r >= start; r--) {
+            let hasSomething = false;
+            for (const c of keyCols) {
+                if (c >= 0) {
+                    const v = (data[r]?.[c] ?? "").toString().trim();
+                    if (v) { hasSomething = true; break; }
+                }
+            }
+            if (hasSomething) return r;
+        }
+        return start - 1;
+    }
+
+    function loadRespondedEmails(sh: ExcelScript.Worksheet | undefined): Set<string> {
+        const set = new Set<string>();
+        if (!sh) return set;
+        const ur = sh.getUsedRange();
+        if (!ur || ur.getRowCount() < 2) return set;
+        const vals = ur.getValues();
+        const header = vals[0].map(v => (v ?? "").toString().toLowerCase());
+        let emailCol = -1;
+        for (let c = 0; c < header.length; c++) {
+            const h = header[c];
+            if (h.includes("correo") || h.includes("email")) { emailCol = c; break; }
+        }
+        if (emailCol === -1) return set;
+        for (let r = 1; r < vals.length; r++) {
+            const e = (vals[r][emailCol] ?? "").toString().trim().toLowerCase();
+            if (e && e.includes("@")) set.add(e);
+        }
+        return set;
+    }
+}
