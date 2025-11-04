@@ -1,0 +1,298 @@
+function main(workbook: ExcelScript.Workbook) {
+    // ========= CONFIG =========
+    const DATA_SHEET = "Base Maestra"; // hoja origen con los datos consolidados
+
+    // ========= VALIDACIONES =========
+    const shData = workbook.getWorksheet(DATA_SHEET);
+    if (!shData) throw new Error(`No existe la hoja '${DATA_SHEET}'. Ejecuta primero el script que crea la Base Maestra.`);
+
+    const used = shData.getUsedRange();
+    if (!used || used.getRowCount() < 2) throw new Error(`'${DATA_SHEET}' no tiene datos suficientes.`);
+
+    const vals: (string | number | boolean)[][] = used.getValues();
+    const header: string[] = vals[0].map(v => (v ?? "").toString().trim());
+    const idxPeriodo = findCol(header, "Periodo");
+    const idxOrigenHoja = findCol(header, "OrigenHoja");
+    const idxRespondio = findCol(header, "Respondio");
+    const idxCarrera = findCol(header, "Carrera");
+
+    if (idxOrigenHoja === -1 || idxRespondio === -1 || idxPeriodo === -1) {
+        throw new Error("Faltan columnas requeridas en 'Base Maestra': se necesitan 'OrigenHoja', 'Respondio' y 'Periodo'.");
+    }
+
+    // ========= CREAR HOJA DE SALIDA (no destructivo, nombre corto <=31) =========
+    const outName = `ResDet_${timeSuffix()}`; // p.ej. ResDet_20250827-143010
+    const shOut = addSheetSafe(workbook, outName);
+
+    // ========= AGREGADOS =========
+    type CountRec = { total: number; resp: number; no: number };
+    const perHoja: { [k: string]: CountRec } = {};
+    const perSem: { [key: string]: { anio: string; sem: string; total: number; resp: number; no: number } } = {};
+    const perCarr: { [carrera: string]: CountRec } = {};
+    const perSemCarr: {
+        [key: string]: { anio: string; sem: string; carrera: string; total: number; resp: number; no: number }
+    } = {};
+
+    let total = 0, resp = 0, no = 0;
+
+    for (let r = 1; r < vals.length; r++) {
+        const origen = (vals[r][idxOrigenHoja] ?? "").toString().trim() || "(Sin origen)";
+        const responded = isResponded(vals[r][idxRespondio]);
+        const periodo = (vals[r][idxPeriodo] ?? "").toString().trim();
+        const carrera = idxCarrera >= 0 ? (vals[r][idxCarrera] ?? "").toString().trim() || "(Sin carrera)" : "(Sin carrera)";
+
+        // Por hoja
+        if (!perHoja[origen]) perHoja[origen] = { total: 0, resp: 0, no: 0 };
+        perHoja[origen].total++;
+        responded ? perHoja[origen].resp++ : perHoja[origen].no++;
+
+        // Por semestre
+        const parsed = parseSemester(periodo);
+        const kSem = `${parsed.anio}|||${parsed.sem}`;
+        if (!perSem[kSem]) perSem[kSem] = { anio: parsed.anio, sem: parsed.sem, total: 0, resp: 0, no: 0 };
+        perSem[kSem].total++;
+        responded ? perSem[kSem].resp++ : perSem[kSem].no++;
+
+        // Por carrera
+        if (!perCarr[carrera]) perCarr[carrera] = { total: 0, resp: 0, no: 0 };
+        perCarr[carrera].total++;
+        responded ? perCarr[carrera].resp++ : perCarr[carrera].no++;
+
+        // Año–Semestre–Carrera
+        const kSC = `${parsed.anio}|||${parsed.sem}|||${carrera}`;
+        if (!perSemCarr[kSC]) perSemCarr[kSC] = { anio: parsed.anio, sem: parsed.sem, carrera, total: 0, resp: 0, no: 0 };
+        perSemCarr[kSC].total++;
+        responded ? perSemCarr[kSC].resp++ : perSemCarr[kSC].no++;
+
+        total++;
+        responded ? resp++ : no++;
+    }
+
+    // ========= TABLAS =========
+    let row = 1;
+
+    // Tabla 1: Resumen por hoja
+    shOut.getRange(`A${row}:E${row}`).setValues([["Hoja origen", "Total", "Respondieron", "No respondieron", "% Respuesta"]]);
+    shOut.getRange(`A${row}:E${row}`).getFormat().getFont().setBold(true);
+    row++;
+
+    const hojaRows: (string | number)[][] = Object.entries(perHoja)
+        .map(([k, h]: [string, CountRec]) => [k, h.total, h.resp, h.no, h.total ? h.resp / h.total : 0])
+        .sort((a, b) => (b[1] as number) - (a[1] as number));
+
+    if (hojaRows.length > 0) {
+        shOut.getRangeByIndexes(row - 1, 0, hojaRows.length, 5).setValues(hojaRows);
+        shOut.getRangeByIndexes(row - 1, 4, hojaRows.length, 1).setNumberFormatLocal("0.0%");
+    }
+    const resumenHojaStartRow = row - 1;
+    row += hojaRows.length + 2;
+
+    // Tabla 2: Resumen global
+    shOut.getRange(`A${row}`).setValue("Resumen global");
+    shOut.getRange(`A${row}`).getFormat().getFont().setBold(true);
+    row++;
+    shOut.getRange(`A${row}:B${row}`).setValues([["Métrica", "Valor"]]);
+    shOut.getRange(`A${row}:B${row}`).getFormat().getFont().setBold(true);
+    row++;
+
+    shOut.getRange(`A${row}:B${row + 2}`).setValues([
+        ["Total registros", total],
+        ["Respondieron", resp],
+        ["No respondieron", no]
+    ]);
+    const resumenGlobalStartRow = row - 1;
+    row += 3 + 2;
+
+    // Tabla 3: Conteo por semestre
+    shOut.getRange(`A${row}:F${row}`).setValues([["Año", "Semestre", "Total", "Respondieron", "No respondieron", "% Respuesta"]]);
+    shOut.getRange(`A${row}:F${row}`).getFormat().getFont().setBold(true);
+    row++;
+
+    const semRows: (string | number)[][] = Object.values(perSem)
+        .map((rec: { anio: string; sem: string; total: number; resp: number; no: number }) =>
+            [rec.anio, rec.sem, rec.total, rec.resp, rec.no, rec.total ? rec.resp / rec.total : 0])
+        .sort((a, b) => {
+            const ay = parseInt((a[0] as string) || "0", 10);
+            const by = parseInt((b[0] as string) || "0", 10);
+            if (by !== ay) return by - ay;
+            const order = (s: string) => s === "Ene-Jun" ? 0 : (s === "Ago-Dic" ? 1 : 2);
+            return order(a[1] as string) - order(b[1] as string);
+        });
+
+    if (semRows.length > 0) {
+        shOut.getRangeByIndexes(row - 1, 0, semRows.length, 6).setValues(semRows);
+        shOut.getRangeByIndexes(row - 1, 5, semRows.length, 1).setNumberFormatLocal("0.0%");
+    }
+    row += semRows.length + 2;
+
+    // Tabla 4: Por Carrera
+    shOut.getRange(`A${row}:E${row}`).setValues([["Carrera", "Total", "Respondieron", "No respondieron", "% Respuesta"]]);
+    shOut.getRange(`A${row}:E${row}`).getFormat().getFont().setBold(true);
+    row++;
+
+    const carrRows: (string | number)[][] = Object.entries(perCarr)
+        .map(([c, h]: [string, CountRec]) => [c, h.total, h.resp, h.no, h.total ? h.resp / h.total : 0])
+        .sort((a, b) => (b[1] as number) - (a[1] as number));
+
+    if (carrRows.length > 0) {
+        shOut.getRangeByIndexes(row - 1, 0, carrRows.length, 5).setValues(carrRows);
+        shOut.getRangeByIndexes(row - 1, 4, carrRows.length, 1).setNumberFormatLocal("0.0%");
+    }
+    const resumenCarrStartRow = row - 1;
+    row += carrRows.length + 2;
+
+    // Tabla 5: Año–Semestre–Carrera
+    shOut.getRange(`A${row}:G${row}`).setValues([["Año", "Semestre", "Carrera", "Total", "Respondieron", "No respondieron", "% Respuesta"]]);
+    shOut.getRange(`A${row}:G${row}`).getFormat().getFont().setBold(true);
+    row++;
+
+    const semCarrRows: (string | number)[][] = Object.values(perSemCarr)
+        .map((rec: { anio: string; sem: string; carrera: string; total: number; resp: number; no: number }) =>
+            [rec.anio, rec.sem, rec.carrera, rec.total, rec.resp, rec.no, rec.total ? rec.resp / rec.total : 0])
+        .sort((a, b) => {
+            // Orden: Año desc, Semestre EJ->AD, Carrera asc
+            const ay = parseInt((a[0] as string) || "0", 10), by = parseInt((b[0] as string) || "0", 10);
+            if (by !== ay) return by - ay;
+            const order = (s: string) => s === "Ene-Jun" ? 0 : (s === "Ago-Dic" ? 1 : 2);
+            const diffS = order(a[1] as string) - order(b[1] as string);
+            if (diffS !== 0) return diffS;
+            return (a[2] as string).toString().localeCompare((b[2] as string).toString(), 'es', { sensitivity: 'base' });
+        });
+
+    if (semCarrRows.length > 0) {
+        shOut.getRangeByIndexes(row - 1, 0, semCarrRows.length, 7).setValues(semCarrRows);
+        shOut.getRangeByIndexes(row - 1, 6, semCarrRows.length, 1).setNumberFormatLocal("0.0%");
+    }
+    row += semCarrRows.length + 2;
+
+    // ========= GRÁFICAS =========
+    // 1) Columnas agrupadas: Respondieron vs No por hoja
+    if (hojaRows.length > 0) {
+        const dataRange1 = shOut.getRangeByIndexes(resumenHojaStartRow - 1, 0, hojaRows.length + 1, 4); // A:D
+        const chart1 = shOut.addChart(ExcelScript.ChartType.columnClustered, dataRange1);
+        chart1.setPlotBy(ExcelScript.ChartPlotBy.columns);
+        chart1.getTitle().setText("Respondieron vs No por hoja");
+        chart1.getLegend().setVisible(true);
+        chart1.setPosition(shOut.getRange(`H1`), shOut.getRange(`P16`));
+    }
+
+    // 2) Pastel: Respondieron vs No (global)
+    const pieData = shOut.getRangeByIndexes(resumenGlobalStartRow + 1, 0, 2, 2);
+    const chart2 = shOut.addChart(ExcelScript.ChartType.pie, pieData);
+    chart2.getTitle().setText("Distribución global: Respondieron vs No");
+    chart2.getLegend().setVisible(true);
+    chart2.setPosition(shOut.getRange(`H18`), shOut.getRange(`P33`));
+
+    // 3) Columnas agrupadas: Totales por semestre (Año + Semestre)
+    if (semRows.length > 0) {
+        const helperStart = row;
+        shOut.getRange(`A${helperStart}:B${helperStart}`).setValues([["Etiqueta", "Total"]]);
+        const compact: (string | number)[][] = semRows.map((r: (string | number)[]) => [`${r[0]} ${r[1]}`, r[2]]);
+        shOut.getRangeByIndexes(helperStart, 0, compact.length, 2).setValues(compact);
+
+        const dataRange3 = shOut.getRangeByIndexes(helperStart - 1, 0, compact.length + 1, 2);
+        const chart3 = shOut.addChart(ExcelScript.ChartType.columnClustered, dataRange3);
+        chart3.setPlotBy(ExcelScript.ChartPlotBy.columns);
+        chart3.getTitle().setText("Totales por semestre (Año + Semestre)");
+        chart3.getLegend().setVisible(false);
+        chart3.setPosition(shOut.getRange(`H35`), shOut.getRange(`P60`));
+        row += compact.length + 4;
+    }
+
+    // 4) Columnas: Totales por carrera
+    if (carrRows.length > 0) {
+        const carrStart = row;
+        shOut.getRange(`A${carrStart}:B${carrStart}`).setValues([["Carrera", "Total"]]);
+        const cdata: (string | number)[][] = carrRows.map((r: (string | number)[]) => [r[0], r[1]]);
+        shOut.getRangeByIndexes(carrStart, 0, cdata.length, 2).setValues(cdata);
+
+        const dataRange4 = shOut.getRangeByIndexes(carrStart - 1, 0, cdata.length + 1, 2);
+        const chart4 = shOut.addChart(ExcelScript.ChartType.columnClustered, dataRange4);
+        chart4.setPlotBy(ExcelScript.ChartPlotBy.columns);
+        chart4.getTitle().setText("Totales por carrera");
+        chart4.getLegend().setVisible(false);
+        chart4.setPosition(shOut.getRange(`H62`), shOut.getRange(`P90`));
+        row += cdata.length + 4;
+    }
+
+    // ========= FORMATO GENERAL =========
+    const usedOut = shOut.getUsedRange();
+    if (usedOut) {
+        usedOut.getFormat().getFont().setName("Calibri");
+        usedOut.getFormat().getFont().setSize(11);
+        usedOut.getFormat().setVerticalAlignment(ExcelScript.VerticalAlignment.center);
+        usedOut.getFormat().autofitColumns();
+        usedOut.getFormat().autofitRows();
+    }
+
+    // ======== HELPERS ========
+    function findCol(headers: string[], name: string): number {
+        const target = name.toLowerCase();
+        for (let i = 0; i < headers.length; i++) {
+            if ((headers[i] ?? "").toString().trim().toLowerCase() === target) return i;
+        }
+        return -1;
+    }
+
+    function parseSemester(periodo: string): { anio: string, sem: string } {
+        const p = (periodo || "").toLowerCase();
+        let anio = "";
+        const m = p.match(/(20\d{2})/);
+        if (m) anio = m[1];
+
+        const hasEneJun = /(ene|feb|mar|abr|may|jun|jan|feb|mar|apr|may|jun)/.test(p);
+        const hasAgoDic = /(ago|sep|set|oct|nov|dic|aug|sep|oct|nov|dec)/.test(p);
+
+        let sem = "";
+        if (hasEneJun && !hasAgoDic) sem = "Ene-Jun";
+        else if (hasAgoDic && !hasEneJun) sem = "Ago-Dic";
+        else if (hasEneJun && hasAgoDic) {
+            const posEJ = p.search(/ene|feb|mar|abr|may|jun|jan|feb|mar|apr|may|jun/);
+            const posAD = p.search(/ago|sep|set|oct|nov|dic|aug|sep|oct|nov|dec/);
+            sem = (posEJ !== -1 && (posAD === -1 || posEJ < posAD)) ? "Ene-Jun" : "Ago-Dic";
+        } else {
+            sem = "Sin periodo";
+        }
+        return { anio, sem };
+    }
+
+    function addSheetSafe(wb: ExcelScript.Workbook, desiredName: string): ExcelScript.Worksheet {
+        const name = sanitizeSheetName(desiredName);
+        let finalName = name;
+        let counter = 2;
+        while (wb.getWorksheet(finalName)) {
+            const base = name.length > 28 ? name.substring(0, 28) : name;
+            finalName = `${base}_${counter}`;
+            counter++;
+        }
+        return wb.addWorksheet(finalName);
+    }
+
+    function sanitizeSheetName(n: string): string {
+        // quitar caracteres no permitidos y limitar a 31 chars
+        let s = n.replace(/[:\\/?*\[\]]/g, "");
+        if (s.length > 31) s = s.substring(0, 31);
+        if (s.trim() === "") s = "Resumen";
+        return s;
+    }
+
+    function timeSuffix(): string {
+        const now = new Date();
+        const y = now.getFullYear();
+        const m = (now.getMonth() + 1).toString().padStart(2, "0");
+        const d = now.getDate().toString().padStart(2, "0");
+        const hh = now.getHours().toString().padStart(2, "0");
+        const mm = now.getMinutes().toString().padStart(2, "0");
+        const ss = now.getSeconds().toString().padStart(2, "0");
+        return `${y}${m}${d}-${hh}${mm}${ss}`;
+    }
+
+    // ← Aquí estaba tu error: 'any' no permitido. Uso 'unknown' y normalizo a string.
+    function isResponded(val: unknown): boolean {
+        const raw = (val === null || val === undefined) ? "" : String(val);
+        const s = raw
+            .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // sin acentos
+            .trim().toLowerCase();
+        return s.includes("respondio"); // cubre "respondio" y "respondió"
+    }
+}
