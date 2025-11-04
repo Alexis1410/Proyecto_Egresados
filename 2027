@@ -1,0 +1,149 @@
+function main(workbook: ExcelScript.Workbook) {
+    const SHEETS_2027: string[] = [
+        "egresados ene-jun 2027",
+        "egresados enero-junio 2027",
+        "egresados ago-dic 2027",
+        "egresados agosto-dic 2027",
+        "egresados agosto-dic-2027",
+        "egresado agosto-dic 2027","egresados"
+    ];
+    const OUT = "Base 2027";
+    const RESP_SHEET = "Respondieron";
+
+    let out = workbook.getWorksheet(OUT);
+    if (out) out.delete();
+    out = workbook.addWorksheet(OUT);
+
+    const HEADERS = [
+        "Alumno", "Sexo", "Edad Actual", "Periodo de egreso", "Periodo de ingreso",
+        "Correo personal", "Correo institucional", "Celular", "Carrera", "Modalidad",
+        "RESPONDIO", "Tot Si", "Tot No", "OrigenHoja"
+    ];
+    out.getRange("A1").getResizedRange(0, HEADERS.length - 1).setValues([HEADERS]);
+
+    const respondedSet = loadResponded(workbook.getWorksheet(RESP_SHEET));
+
+    let nextRow = 2;
+    for (const shName of SHEETS_2027) {
+        const ws = workbook.getWorksheet(shName);
+        if (!ws) continue;
+        const used = ws.getUsedRange(); if (!used) continue;
+        const data = used.getValues() as (string | number | boolean)[][];
+        if (data.length < 2) continue;
+
+        const headRow = detectHeaderRow(data);
+        const header = rowToLower(data[headRow]);
+
+        const iAlumno = find(header, ["alumno", "egresado", "estudiante", "nombre"]);
+        const iSexo = find(header, ["sexo", "género", "genero"]);
+        const iEdad = find(header, ["edad actual", "edad"]);
+        const iPerEgr = find(header, ["periodo de egreso", "egreso", "semestre"]);
+        const iPerIng = find(header, ["periodo de ingreso", "ingreso"]);
+        const iCP = find(header, ["correo personal", "correo particular", "personal"]);
+        const iCI = find(header, ["correo itq", "correo institucional", "institucional", "itq"]);
+        const iCel = find(header, ["celular", "telefono", "teléfono", "tel"]);
+        const iCarr = find(header, ["carrera", "programa"]);
+        const iMod = find(header, ["modalidad"]);
+
+        for (let r = headRow + 1; r < data.length; r++) {
+            if (isRowEmpty(data[r], [iAlumno, iCP, iCI])) continue;
+
+            const alumno = toTitle(String(data[r][iAlumno] ?? ""));
+            const sexo = String(data[r][iSexo] ?? "");
+            const edad = String(data[r][iEdad] ?? "");
+            const perEgr = String(data[r][iPerEgr] ?? "");
+            const perIng = String(data[r][iPerIng] ?? "");
+            const cpRaw = String(data[r][iCP] ?? "");
+            const ciRaw = String(data[r][iCI] ?? "");
+            const cel = String(data[r][iCel] ?? "");
+            const carr = String(data[r][iCarr] ?? "");
+            const mod = String(data[r][iMod] ?? "");
+
+            const cpLow = normalizeEmail(cpRaw);
+            const ciLow = normalizeEmail(ciRaw);
+            const resp = (cpLow && respondedSet.has(cpLow)) || (ciLow && respondedSet.has(ciLow)) ? "Sí" : "No";
+
+            const outRow: (string | number | boolean)[] = [
+                alumno, sexo, edad, perEgr, perIng,
+                cpRaw, ciRaw, cel, carr, mod,
+                resp, "", "", shName
+            ];
+            out.getCell(nextRow - 1, 0).getResizedRange(0, HEADERS.length - 1).setValues([outRow]);
+            nextRow++;
+        }
+    }
+
+    const usedOut = out.getUsedRange();
+    if (usedOut) {
+        const vals = usedOut.getValues() as (string | number | boolean)[][];
+        if (vals.length > 1) {
+            const hdr = rowToLower(vals[0]);
+            const iResp = hdr.indexOf("respondio");
+            const iSi = hdr.indexOf("tot si");
+            const iNo = hdr.indexOf("tot no");
+            let totSi = 0, totNo = 0;
+            for (let r = 1; r < vals.length; r++) {
+                const t = normalizeText(vals[r][iResp]);
+                if (t === "si") totSi++; else if (t === "no") totNo++;
+            }
+            for (let r = 1; r < vals.length; r++) { vals[r][iSi] = totSi; vals[r][iNo] = totNo; }
+            usedOut.setValues(vals);
+        }
+    }
+
+    const tbl = out.addTable(out.getUsedRange(), true);
+    tbl.setName("tblBase2027");
+    tbl.setPredefinedTableStyle("TableStyleMedium9");
+    out.getFreezePanes().freezeRows(1);
+    out.getUsedRange()?.getFormat().autofitColumns();
+
+    // Helpers
+    function loadResponded(sh?: ExcelScript.Worksheet): Set<string> {
+        const set = new Set<string>(); if (!sh) return set;
+        const ur = sh.getUsedRange(); if (!ur || ur.getRowCount() < 2) return set;
+        const v = ur.getValues() as (string | number | boolean)[][];
+        for (let r = 1; r < v.length; r++) for (let c = 0; c < v[r].length; c++) {
+            const mail = normalizeEmail(v[r][c]); if (mail && mail.includes("@")) set.add(mail);
+        }
+        return set;
+    }
+    function detectHeaderRow(data: (string | number | boolean)[][]): number {
+        const maxScan = Math.min(12, data.length);
+        let bestRow = 0, bestScore = -1;
+        const keys = ["alumno", "correo personal", "correo itq", "correo institucional", "carrera", "periodo de egreso"];
+        for (let r = 0; r < maxScan; r++) {
+            const row = rowToLower(data[r]); let score = 0;
+            for (let k = 0; k < keys.length; k++) {
+                const key = keys[k];
+                for (let c = 0; c < row.length; c++) if (row[c].includes(key)) { score++; break; }
+            }
+            if (score > bestScore) { bestScore = score; bestRow = r; }
+        }
+        return bestRow;
+    }
+    function rowToLower(row: (string | number | boolean)[]): string[] {
+        const out: string[] = []; for (let i = 0; i < row.length; i++) out.push(String(row[i] ?? "").toLowerCase().trim()); return out;
+    }
+    function find(header: string[], keys: string[]): number {
+        for (let i = 0; i < header.length; i++) { const h = header[i]; for (let k = 0; k < keys.length; k++) if (h.includes(keys[k])) return i; } return -1;
+    }
+    function normalizeEmail(v: unknown): string {
+        const s0 = (v === null || v === undefined) ? "" : String(v);
+        const m = s0.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+        const s1 = (m ? m[0] : s0).toLowerCase();
+        return s1.replace(/\s+/g, "").trim();
+    }
+    function normalizeText(v: unknown): string {
+        return String(v ?? "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    }
+    function isRowEmpty(row: (string | number | boolean)[], cols: number[]): boolean {
+        for (let i = 0; i < cols.length; i++) { const c = cols[i]; if (c >= 0) { const s = String(row[c] ?? "").trim(); if (s) return false; } } return true;
+    }
+    function toTitle(raw: string): string {
+        const s = String(raw ?? "").toLowerCase().trim(); if (!s) return "";
+        const keep = new Set(["de", "del", "la", "las", "los", "y", "e"]);
+        const parts = s.split(/\s+/);
+        for (let i = 0; i < parts.length; i++) { const w = parts[i]; parts[i] = (i > 0 && keep.has(w)) ? w : (w.charAt(0).toUpperCase() + w.slice(1)); }
+        return parts.join(" ");
+    }
+}
