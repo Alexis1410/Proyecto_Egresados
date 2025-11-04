@@ -1,0 +1,451 @@
+function main(workbook: ExcelScript.Workbook) {
+  // ========= CONFIG =========
+  const RESP_SHEET = "Respondieron";
+  const OUT_SHEET = "Base Maestra";
+  const SUMMARY_SHEET = "Resumen (largo)";
+
+  // Posibles fuentes (2022–2027 y 2025 por semestre). Se toman solo las que existan.
+  const possibleSources = [
+    "Base 2022", "Base 2023", "Base 2024",
+    "Base 2025 Ene-Jun", "Base 2025 Ago-Dic", "Base 2025",
+    "Base 2026", "Base 2027"
+  ];
+  const SOURCE_SHEETS: string[] =
+    possibleSources.filter((n) => workbook.getWorksheet(n) !== undefined);
+  if (SOURCE_SHEETS.length === 0) {
+    throw new Error("No se encontraron hojas fuente. Debe existir al menos una de: " + possibleSources.join(", "));
+  }
+
+  // ========= HELPERS (hoja) =========
+  const resetSheet = (wb: ExcelScript.Workbook, name: string): ExcelScript.Worksheet => {
+    const s = wb.getWorksheet(name);
+    if (s) s.delete();
+    return wb.addWorksheet(name);
+  };
+
+  // ========= HELPERS (utilidades) =========
+  const clean = (v: unknown): string =>
+    (v == null ? "" : String(v))
+      .replace(/[\r\n\t]/g, " ")
+      .replace(/[|#]+/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+
+  const toTitle = (raw: string): string => {
+    const s = clean(raw).toLowerCase();
+    if (!s) return "";
+    const keep = new Set(["de", "del", "la", "las", "los", "y", "e", "da", "dos", "das"]);
+    const parts = s.split(" ");
+    for (let i = 0; i < parts.length; i++) {
+      const w = parts[i];
+      if (i > 0 && keep.has(w)) continue;
+      parts[i] = w.charAt(0).toUpperCase() + w.slice(1);
+    }
+    return parts.join(" ");
+  };
+
+  const norm = (s: string): string => String(s ?? "").toLowerCase().trim();
+
+  const normSexo = (v: string): string => {
+    const s = clean(v).toLowerCase();
+    if (!s) return "";
+    if (s === "m" || /^m(asc|ale)?$/.test(s) || s.startsWith("m")) return "M";
+    if (s === "f" || /^f(em|emina)?$/.test(s) || s.startsWith("f")) return "F";
+    return s.toUpperCase();
+  };
+
+  const normalizeEmail = (v: unknown): string => {
+    const s0 = v == null ? "" : String(v);
+    const m = s0.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    const s1 = (m ? m[0] : s0).toLowerCase();
+    return s1.replace(/\s+/g, "").trim();
+  };
+
+  const sampleSize = (N: number, e: number): number => {
+    // p=0.5, Z≈1 (conf ~80%), error e (0.1=10%)
+    const Z2 = 1; const pq = 0.25;
+    if (N <= 0) return 0;
+    const n = (Z2 * pq * N) / (e * e * (N - 1) + Z2 * pq);
+    return Math.round(n);
+  };
+
+  const extractYear = (s: string): string => {
+    const m = (s || "").match(/(20\d{2})/);
+    return m ? m[1] : "";
+  };
+
+  const semesterOf = (texto: string): "Ene-Jun" | "Ago-Dic" | "Sin periodo" => {
+    const t = (texto || "").toLowerCase();
+    const hasEJ = /(ene|jan|feb|mar|abr|apr|may|jun)/.test(t);
+    const hasAD = /(ago|aug|sep|oct|nov|dic|dec)/.test(t);
+    if (hasEJ && !hasAD) return "Ene-Jun";
+    if (hasAD && !hasEJ) return "Ago-Dic";
+    const posEJ = t.search(/ene|jan|feb|mar|abr|apr|may|jun/);
+    const posAD = t.search(/ago|aug|sep|oct|nov|dic|dec/);
+    if (posEJ !== -1 && (posAD === -1 || posEJ < posAD)) return "Ene-Jun";
+    if (posAD !== -1) return "Ago-Dic";
+    return "Sin periodo";
+  };
+
+  const normalizePeriodo = (rawPeriodo: string, origenHoja: string): string => {
+    // Intenta deducir semestre y año; si falta año en celda, usa nombre de hoja.
+    const sem = semesterOf(rawPeriodo);
+    const y1 = extractYear(rawPeriodo);
+    const y2 = extractYear(origenHoja);
+    const yyyy = y1 || y2;
+    if (!yyyy && sem === "Sin periodo") return "Sin periodo";
+    if (!yyyy) return sem; // sin año, pero al menos el semestre
+    return `${yyyy} ${sem}`;
+  };
+
+  // Construye NumControl desde valor crudo o infiere del correo institucional
+  const buildNumControl = (ctrlRaw: string, correoInst: string): string => {
+    const raw = (ctrlRaw || "").replace(/[^A-Za-z0-9]/g, "");
+    if (/^[A-Za-z]?\d{8,10}$/.test(raw)) return raw.toUpperCase();
+    const ci = correoInst || "";
+    const m1 = ci.match(/^([A-Za-z]?\d{8,10})@/i);
+    if (m1) return m1[1].toUpperCase();
+    const m2 = ci.match(/([A-Za-z]?\d{8,10})/i);
+    if (m2) return m2[1].toUpperCase();
+    return raw.toUpperCase();
+  };
+
+  const semesterLabel = (periodoUniforme: string): string => {
+    // Recibe valores como "2024 Ene-Jun" o "Sin periodo"
+    const sem = semesterOf(periodoUniforme);
+    return sem;
+  };
+
+  const buildPreferredPeriods = (setIn: Set<string>): string[] => {
+    type P = { raw: string; year: number; sem: number };
+    const arr = Array.from(setIn);
+    const parsed: P[] = arr.map((s) => {
+      const low = s.toLowerCase();
+      const m = low.match(/20\d{2}/);
+      const year = m ? parseInt(m[0], 10) : 0;
+      let sem = 2;
+      if (/(ene|jan|feb|mar|abr|apr|may|jun)/.test(low)) sem = 0;
+      else if (/(ago|aug|sep|oct|nov|dic|dec)/.test(low)) sem = 1;
+      return { raw: s, year, sem };
+    });
+    parsed.sort((a, b) => (b.year !== a.year ? b.year - a.year : a.sem - b.sem));
+    return parsed.map(p => p.raw);
+  };
+
+  // ========= CARGAR 'RESPONDIERON' (opcional) =========
+  const respondedSet = new Set<string>();
+  const shResp = workbook.getWorksheet(RESP_SHEET);
+  if (shResp) {
+    const respVals = shResp.getUsedRange()?.getValues() as (string | number | boolean)[][];
+    if (respVals && respVals.length) {
+      for (let r = 0; r < respVals.length; r++) {
+        const row = respVals[r];
+        for (let c = 0; c < row.length; c++) {
+          const s = norm(String(row[c] ?? ""));
+          if (s.includes("@")) respondedSet.add(s);
+        }
+      }
+    }
+  }
+
+  // ========= BASE MAESTRA (salida) =========
+  const shOut = resetSheet(workbook, OUT_SHEET);
+  const baseHeader: string[] = [
+    "Nombre", "NumControl", "Sexo", "Edad", "Carrera", "Periodo",
+    "CorreoPersonal", "CorreoInstitucional", "Celular", "OrigenHoja", "Estado"
+  ];
+  shOut.getRange("A1").getResizedRange(0, baseHeader.length - 1).setValues([baseHeader]);
+
+  const outRows: (string | number)[][] = [];
+
+  // ========= IMPORTACIÓN DESDE TODAS LAS FUENTES =========
+  for (let s = 0; s < SOURCE_SHEETS.length; s++) {
+    const name = SOURCE_SHEETS[s];
+    const ws = workbook.getWorksheet(name);
+    if (!ws) continue;
+
+    const ur = ws.getUsedRange();
+    if (!ur) continue;
+
+    const data = ur.getValues() as (string | number | boolean)[][];
+    if (!data || data.length < 2) continue;
+
+    // Mapeo por encabezados esperados en tus "Base YYYY"
+    const hdr = data[0].map(v => String(v ?? "").toLowerCase().trim());
+    const idxNombre = hdr.indexOf("alumno") >= 0 ? hdr.indexOf("alumno") : hdr.indexOf("nombre");
+    const idxNum = hdr.indexOf("numcontrol");
+    const idxSexo = hdr.indexOf("sexo");
+    const idxEdad = hdr.indexOf("edad actual") >= 0 ? hdr.indexOf("edad actual") : hdr.indexOf("edad");
+    const idxCarr = hdr.indexOf("carrera");
+    const idxPer = hdr.indexOf("periodo de egreso") >= 0 ? hdr.indexOf("periodo de egreso") : hdr.indexOf("periodo");
+    const idxCP = hdr.indexOf("correo personal");
+    const idxCI = (hdr.indexOf("correo institucional") >= 0) ? hdr.indexOf("correo institucional") : hdr.indexOf("correo itq");
+    const idxCel = hdr.indexOf("celular");
+
+    for (let r = 1; r < data.length; r++) {
+      const row = data[r];
+      let nombre = clean(idxNombre >= 0 ? row[idxNombre] : "");
+      if (!nombre) continue;
+
+      // Limpiezas y normalizaciones
+      nombre = toTitle(nombre);
+      const sexo = normSexo(clean(idxSexo >= 0 ? row[idxSexo] : ""));
+      const edad = clean(idxEdad >= 0 ? row[idxEdad] : "");
+      const carrera = clean(idxCarr >= 0 ? row[idxCarr] : "");
+      const cp = normalizeEmail(idxCP >= 0 ? row[idxCP] : "");
+      const ci = normalizeEmail(idxCI >= 0 ? row[idxCI] : "");
+      const cel = clean(idxCel >= 0 ? row[idxCel] : "");
+      const numCtrl = buildNumControl(clean(idxNum >= 0 ? row[idxNum] : ""), ci);
+
+      const periodoRaw = clean(idxPer >= 0 ? row[idxPer] : "");
+      const periodo = normalizePeriodo(periodoRaw, name); // <-- Uniforme: "YYYY Ene-Jun" / "YYYY Ago-Dic" / "Sin periodo"
+
+      const estado = (cp && respondedSet.has(cp)) || (ci && respondedSet.has(ci)) ? "Respondió" : "No respondió";
+
+      outRows.push([nombre, numCtrl, sexo, edad, carrera, periodo, cp, ci, cel, name, estado]);
+    }
+  }
+
+  if (!outRows.length) throw new Error("No se importaron filas. Revisa nombres de hojas y encabezados.");
+
+  // Volcar y dar formato
+  shOut.getRangeByIndexes(1, 0, outRows.length, baseHeader.length).setValues(outRows);
+  const baseLast = 1 + outRows.length;
+  const tblBase = shOut.addTable(shOut.getRangeByIndexes(0, 0, baseLast, baseHeader.length), true);
+  tblBase.setName("tblBaseMaestra");
+  tblBase.setPredefinedTableStyle("TableStyleMedium9");
+  tblBase.getSort().apply([{ key: 4, ascending: true }, { key: 0, ascending: true }]);
+
+  // Encabezado
+  const hdrRange = tblBase.getHeaderRowRange();
+  hdrRange.getFormat().getFill().setColor("#0B5F9A");
+  hdrRange.getFormat().getFont().setColor("#FFFFFF");
+  hdrRange.getFormat().getFont().setBold(true);
+  hdrRange.getFormat().setHorizontalAlignment(ExcelScript.HorizontalAlignment.center);
+
+  // Tipografía/anchos
+  const all = tblBase.getRange();
+  all.getFormat().getFont().setName("Calibri");
+  all.getFormat().getFont().setSize(11);
+  all.getFormat().setVerticalAlignment(ExcelScript.VerticalAlignment.center);
+  all.getFormat().setWrapText(false);
+  all.getFormat().autofitColumns();
+  all.getFormat().autofitRows();
+  shOut.getRange("A:A").getFormat().setColumnWidth(30);
+  shOut.getRange("B:B").getFormat().setColumnWidth(16);
+  shOut.getRange("C:C").getFormat().setColumnWidth(12);
+  shOut.getRange("D:D").getFormat().setColumnWidth(10);
+  shOut.getRange("E:E").getFormat().setColumnWidth(28);
+  shOut.getRange("F:F").getFormat().setColumnWidth(18);
+  shOut.getRange("G:H").getFormat().setColumnWidth(34);
+  shOut.getRange("I:I").getFormat().setColumnWidth(16);
+  shOut.getRange("J:J").getFormat().setColumnWidth(20);
+  shOut.getRange("K:K").getFormat().setColumnWidth(18);
+  shOut.getFreezePanes().freezeRows(1);
+
+  // Zebra (filas pares)
+  const bodyAddr: string = tblBase.getRangeBetweenHeaderAndTotal().getAddress();
+  const zebraCF = shOut.getRange(bodyAddr).addConditionalFormat(ExcelScript.ConditionalFormatType.custom);
+  zebraCF.getCustom().getRule().setFormula("=ISEVEN(ROW())");
+  zebraCF.getCustom().getFormat().getFill().setColor("#F7FAFF");
+
+  // Estado (Respondió / No respondió)
+  const estadoRange = tblBase.getColumns()[10].getRangeBetweenHeaderAndTotal();
+  const okCF = estadoRange.addConditionalFormat(ExcelScript.ConditionalFormatType.containsText);
+  okCF.getTextComparison().setRule({ operator: ExcelScript.ConditionalTextOperator.contains, text: "Respondió" });
+  okCF.getTextComparison().getFormat().getFill().setColor("#A9DFBF");
+  okCF.getTextComparison().getFormat().getFont().setColor("#000000");
+  const noCF = estadoRange.addConditionalFormat(ExcelScript.ConditionalFormatType.containsText);
+  noCF.getTextComparison().setRule({ operator: ExcelScript.ConditionalTextOperator.contains, text: "No respondió" });
+  noCF.getTextComparison().getFormat().getFill().setColor("#F5B7B1");
+  noCF.getTextComparison().getFormat().getFont().setColor("#000000");
+
+  // ========= RESUMEN (LARGO) =========
+  const shSum = resetSheet(workbook, SUMMARY_SHEET);
+  shSum.getRange("A1").setValue("Resumen de respuestas por Carrera y Periodo");
+  const title = shSum.getRange("A1");
+  title.getFormat().getFont().setBold(true);
+  title.getFormat().getFont().setSize(16);
+  title.getFormat().getFont().setColor("#1F4E79");
+  shSum.getRange("A2").setValue("Incluye Totales, % de respuesta y Tamaño de muestra estimado (e=10%, p=0.5).");
+  shSum.getRange("A2").getFormat().getFont().setColor("#5F6B7A");
+
+  const sumHeader = ["Carrera", "Periodo", "Total egresados", "Respondieron", "No respondieron", "% Resp", "Muestra (n)"];
+  shSum.getRange("A4").getResizedRange(0, sumHeader.length - 1).setValues([sumHeader]);
+
+  const idxCarr = baseHeader.indexOf("Carrera");
+  const idxPer = baseHeader.indexOf("Periodo");
+  const idxEst = baseHeader.indexOf("Estado");
+
+  const agg: { [carrera: string]: { [periodo: string]: { total: number; resp: number } } } = {};
+  const periodSet = new Set<string>();
+
+  for (let i = 0; i < outRows.length; i++) {
+    const c = String(outRows[i][idxCarr] ?? "(Sin carrera)");
+    const p = String(outRows[i][idxPer] ?? "(Sin periodo)");
+    const e = String(outRows[i][idxEst] ?? "");
+    periodSet.add(p);
+    if (!agg[c]) agg[c] = {};
+    if (!agg[c][p]) agg[c][p] = { total: 0, resp: 0 };
+    agg[c][p].total++;
+    if (e === "Respondió") agg[c][p].resp++;
+  }
+
+  const prefPeriods = buildPreferredPeriods(periodSet);
+  const carreras = Object.keys(agg).sort((a, b) => a.localeCompare(b, "es", { sensitivity: "base" }));
+
+  const longRows: (string | number)[][] = [];
+  for (let ci = 0; ci < carreras.length; ci++) {
+    const c = carreras[ci];
+    for (let pi = 0; pi < prefPeriods.length; pi++) {
+      const p = prefPeriods[pi];
+      const d = agg[c][p] ? agg[c][p] : { total: 0, resp: 0 };
+      const no = d.total - d.resp;
+      const pct = d.total ? d.resp / d.total : 0;
+      longRows.push([c, p, d.total, d.resp, no, pct, sampleSize(d.total, 0.1)]);
+    }
+  }
+  if (longRows.length > 0) {
+    shSum.getRangeByIndexes(4, 0, longRows.length, sumHeader.length).setValues(longRows);
+    shSum.getRangeByIndexes(4, 5, longRows.length, 1).setNumberFormatLocal("0.0%");
+  }
+
+  const lastSumRow = 4 + longRows.length;
+  const tblSum = shSum.addTable(shSum.getRangeByIndexes(3, 0, (lastSumRow - 3), sumHeader.length), true);
+  tblSum.setPredefinedTableStyle("TableStyleMedium9");
+  const hdrRow = shSum.getRange("A4:G4");
+  hdrRow.getFormat().getFill().setColor("#1F4E79");
+  hdrRow.getFormat().getFont().setColor("#FFFFFF");
+  hdrRow.getFormat().getFont().setBold(true);
+  shSum.getUsedRange()?.getFormat().autofitColumns();
+  shSum.getUsedRange()?.getFormat().autofitRows();
+
+  // ===== TARJETAS por carrera (periodos) =====
+  const chartsPerRow = 2;
+  const cardW = 12; // columnas
+  const cardH = 16; // filas
+  const chartsStartRow = lastSumRow + 2;
+
+  for (let ci = 0; ci < carreras.length; ci++) {
+    const c = carreras[ci];
+    const blockHeader = ["Periodo", "Respondieron", "No respondieron", "% Resp", "Muestra (n)"];
+    const block: (string | number)[][] = [blockHeader];
+    for (let pi = 0; pi < prefPeriods.length; pi++) {
+      const p = prefPeriods[pi];
+      const d = agg[c][p] ? agg[c][p] : { total: 0, resp: 0 };
+      const no = d.total - d.resp;
+      const pct = d.total ? d.resp / d.total : 0;
+      const n = sampleSize(d.total, 0.1);
+      block.push([p, d.resp, no, pct, n]);
+    }
+    const rowPos = chartsStartRow + Math.floor(ci / chartsPerRow) * (cardH + 2);
+    const colPos = 1 + (ci % chartsPerRow) * (cardW + 2);
+    const blockRows = block.length;
+    const blockCols = blockHeader.length;
+
+    shSum.getRangeByIndexes(rowPos - 1, colPos - 1, blockRows, blockCols).setValues(block);
+    shSum.getRangeByIndexes(rowPos, colPos + 3 - 1, blockRows - 1, 1).setNumberFormatLocal("0.0%");
+    shSum.getRangeByIndexes(rowPos - 1, colPos - 1, 1, blockCols).getFormat().getFill().setColor("#E8EEF7");
+
+    const dataRange = shSum.getRangeByIndexes(rowPos - 1, colPos - 1, blockRows, 3);
+    const ch = shSum.addChart(ExcelScript.ChartType.columnStacked, dataRange);
+    ch.setPlotBy(ExcelScript.ChartPlotBy.columns);
+    ch.getTitle().setText(`Respondieron vs No — ${c}`);
+    ch.getLegend().setPosition(ExcelScript.ChartLegendPosition.bottom);
+    ch.setPosition(
+      shSum.getRangeByIndexes(rowPos - 1, colPos - 1, 1, 1),
+      shSum.getRangeByIndexes(rowPos - 1 + cardH, colPos - 1 + cardW, 1, 1)
+    );
+  }
+
+  // ===== CARRERA × SEMESTRE + GLOBAL por semestre =====
+  const semAggByCarr: { [carrera: string]: { [sem: string]: { total: number; resp: number } } } = {};
+  const globSem: { [sem: string]: { total: number; resp: number } } = {};
+
+  for (let i = 0; i < outRows.length; i++) {
+    const carr = String(outRows[i][idxCarr] ?? "(Sin carrera)");
+    const periodo = String(outRows[i][idxPer] ?? "");
+    const est = String(outRows[i][idxEst] ?? "");
+    const sem = semesterLabel(periodo);
+
+    if (!semAggByCarr[carr]) semAggByCarr[carr] = {};
+    if (!semAggByCarr[carr][sem]) semAggByCarr[carr][sem] = { total: 0, resp: 0 };
+    semAggByCarr[carr][sem].total++;
+    if (est === "Respondió") semAggByCarr[carr][sem].resp++;
+
+    if (!globSem[sem]) globSem[sem] = { total: 0, resp: 0 };
+    globSem[sem].total++;
+    if (est === "Respondió") globSem[sem].resp++;
+  }
+
+  const semSectionTop = chartsStartRow + Math.ceil(carreras.length / chartsPerRow) * (cardH + 2) + 2;
+
+  // 1) % por carrera (Ene-Jun vs Ago-Dic)
+  shSum.getRange(`A${semSectionTop}`).setValue("Por carrera y semestre (% de respuesta)");
+  shSum.getRange(`A${semSectionTop}`).getFormat().getFont().setBold(true);
+
+  const semHdr = ["Carrera", "% Resp Ene-Jun", "% Resp Ago-Dic", "EJ Resp", "EJ No", "AD Resp", "AD No", "EJ n", "AD n"];
+  shSum.getRangeByIndexes(semSectionTop, 0, 1, semHdr.length).setValues([semHdr]);
+
+  const semRows: (string | number)[][] = carreras.map((c) => {
+    const ej = semAggByCarr[c]?.["Ene-Jun"] ?? { total: 0, resp: 0 };
+    const ad = semAggByCarr[c]?.["Ago-Dic"] ?? { total: 0, resp: 0 };
+    const ejPct = ej.total ? ej.resp / ej.total : 0;
+    const adPct = ad.total ? ad.resp / ad.total : 0;
+    const ejNo = ej.total - ej.resp;
+    const adNo = ad.total - ad.resp;
+    return [c, ejPct, adPct, ej.resp, ejNo, ad.resp, adNo, sampleSize(ej.total, 0.1), sampleSize(ad.total, 0.1)];
+  });
+
+  if (semRows.length > 0) {
+    shSum.getRangeByIndexes(semSectionTop + 1, 0, semRows.length, semHdr.length).setValues(semRows);
+    shSum.getRangeByIndexes(semSectionTop + 1, 1, semRows.length, 2).setNumberFormatLocal("0.0%");
+  }
+
+  const semPctRange = shSum.getRangeByIndexes(semSectionTop, 0, semRows.length + 1, 3);
+  const chPct = shSum.addChart(ExcelScript.ChartType.columnClustered, semPctRange);
+  chPct.getTitle().setText("% de respuesta por Carrera y Semestre");
+  chPct.getLegend().setPosition(ExcelScript.ChartLegendPosition.bottom);
+  chPct.setPosition(
+    shSum.getRangeByIndexes(semSectionTop, 10, 1, 1),
+    shSum.getRangeByIndexes(semSectionTop + 18, 24, 1, 1)
+  );
+
+  // 2) Global por semestre
+  const globTop = semSectionTop + Math.max(semRows.length + 4, 20);
+  shSum.getRange(`A${globTop}`).setValue("Global por semestre");
+  shSum.getRange(`A${globTop}`).getFormat().getFont().setBold(true);
+
+  const globHdr = ["Semestre", "Respondieron", "No respondieron", "% Resp", "Muestra (n)"];
+  shSum.getRangeByIndexes(globTop, 0, 1, globHdr.length).setValues([globHdr]);
+
+  const semList = ["Ene-Jun", "Ago-Dic", "Sin periodo"];
+  const gRows: (string | number)[][] = semList.map((s) => {
+    const d = globSem[s] ?? { total: 0, resp: 0 };
+    const no = d.total - d.resp;
+    const pct = d.total ? d.resp / d.total : 0;
+    return [s, d.resp, no, pct, sampleSize(d.total, 0.1)];
+  });
+
+  shSum.getRangeByIndexes(globTop + 1, 0, gRows.length, globHdr.length).setValues(gRows);
+  shSum.getRangeByIndexes(globTop + 1, 3, gRows.length, 1).setNumberFormatLocal("0.0%");
+
+  const globData = shSum.getRangeByIndexes(globTop, 0, gRows.length + 1, 3);
+  const chGlob = shSum.addChart(ExcelScript.ChartType.columnStacked, globData);
+  chGlob.getTitle().setText("Respondieron vs No — Global por semestre");
+  chGlob.getLegend().setPosition(ExcelScript.ChartLegendPosition.bottom);
+  chGlob.setPosition(
+    shSum.getRangeByIndexes(globTop, 10, 1, 1),
+    shSum.getRangeByIndexes(globTop + 16, 24, 1, 1)
+  );
+
+  // Tipografía general del Resumen
+  const usedAll = shSum.getUsedRange();
+  if (usedAll) {
+    usedAll.getFormat().getFont().setName("Calibri");
+    usedAll.getFormat().getFont().setSize(11);
+    usedAll.getFormat().setVerticalAlignment(ExcelScript.VerticalAlignment.center);
+    usedAll.getFormat().autofitColumns();
+    usedAll.getFormat().autofitRows();
+  }
+}
