@@ -1,0 +1,331 @@
+Resumen empleo
+
+function main(workbook: ExcelScript.Workbook) {
+  // === CONFIG ===
+  const RESP_SHEET = "Respondieron";
+  const OUT_SHEET = "Resumen empleo";
+
+  // === Helpers ===
+  type Cell = string | number | boolean | null | undefined;
+  const norm = (s: Cell): string => String(s ?? "").trim();
+  const lower = (s: Cell): string => norm(s).toLowerCase();
+
+  const getUsed = (ws: ExcelScript.Worksheet): Cell[][] =>
+    (ws.getUsedRange()?.getValues() as Cell[][]) ?? [];
+
+  const pickCol = (headers: string[], keys: string[]): number => {
+    const lheaders = headers.map(h => h.toLowerCase());
+    for (let i = 0; i < lheaders.length; i++) {
+      for (const k of keys) {
+        if (lheaders[i].includes(k.toLowerCase())) return i;
+      }
+    }
+    return -1;
+  };
+
+  // Sí / No / Aún no…
+  const toPerfil = (v: Cell): "si" | "no" | "" => {
+    const s = lower(v);
+    if (!s) return "";
+    // casos que NO queremos contar (sin empleo)
+    if (s.includes("aún no") || s.includes("aun no") || s.includes("no he tenido empleo"))
+      return "";
+
+    if (/^s[ií]/.test(s) || s.includes("aplica") || s.includes("dentro") || s.includes("en perfil"))
+      return "si";
+
+    if (/^no\b/.test(s) || s.includes("fuera"))
+      return "no";
+
+    return "";
+  };
+
+  // Parseo robusto de meses a número aproximado
+  const parseMonths = (v: Cell): number | null => {
+    let s = lower(v).replace(/\s+/g, " ");
+    if (!s) return null;
+
+    // casos sin empleo
+    if (s.includes("aún no") || s.includes("aun no") || s.includes("no he tenido empleo"))
+      return null;
+
+    if (s.includes("inmediat")) return 0;
+
+    // rangos típicos
+    if (/0\s*[-–a]\s*3/.test(s)) return 1.5;
+    if (/4\s*[-–a]\s*6/.test(s)) return 5;
+    if (/(6|7)\s*[-–a]\s*12/.test(s) || s.includes("6 meses a 1 año")) return 9;
+    if (s.includes("más de 12") || s.includes("mas de 12") || s.includes("más de un año"))
+      return 14;
+
+    // "3 meses", "8 meses", etc.
+    const m = s.match(/(\d+)\s*mes/);
+    if (m) return parseInt(m[1], 10);
+
+    // "2 años"
+    const y = s.match(/(\d+)\s*año/);
+    if (y) return parseInt(y[1], 10) * 12;
+
+    const num = parseFloat(s.replace(/,/g, "."));
+    return isNaN(num) ? null : num;
+  };
+
+  type TramoKey = "0–3" | "4–6" | "7–12" | "13+" | "sin dato";
+  const tramo = (m: number | null): TramoKey => {
+    if (m === null) return "sin dato";
+    if (m <= 3) return "0–3";
+    if (m <= 6) return "4–6";
+    if (m <= 12) return "7–12";
+    return "13+";
+  };
+
+  const pct = (a: number, b: number): number => (b > 0 ? a / b : 0);
+  const prom = (s: number, n: number): number => (n > 0 ? s / n : 0);
+
+  // === LEER RESPUESTAS ===
+  const shResp = workbook.getWorksheet(RESP_SHEET);
+  if (!shResp) throw new Error(`No existe hoja "${RESP_SHEET}".`);
+  const respVals = getUsed(shResp);
+  if (respVals.length < 2) throw new Error(`"${RESP_SHEET}" sin datos.`);
+
+  const hdr = respVals[0].map(v => String(v));
+
+  const iCarr = pickCol(hdr, [
+    "seleccione la carrera",
+    "carrera de egreso",
+    "carrera"
+  ]);
+
+  const iPerf = pickCol(hdr, [
+    "actualmente labora aplicando su carrera",
+    "labora aplicando",
+    "aplicando su carrera",
+    "en perfil",
+    "perfil profesional"
+  ]);
+
+  const iMes = pickCol(hdr, [
+    "cuánto tiempo tardaste",
+    "cuanto tiempo tardaste",
+    "tiempo tardaste",
+    "primer empleo",
+    "meses"
+  ]);
+
+  const iIng = pickCol(hdr, [
+    "ingreso promedio que recibiste en tu primer empleo",
+    "ingreso promedio",
+    "primer empleo",
+    "ingreso"
+  ]);
+
+  if (iCarr < 0) throw new Error("No encontré columna de Carrera.");
+  if (iPerf < 0) throw new Error("No encontré columna de Perfil / labora aplicando.");
+  if (iMes < 0) throw new Error("No encontré columna de tiempo (meses) a primer empleo.");
+  if (iIng < 0) throw new Error("No encontré columna de ingreso promedio (primer empleo).");
+
+  // === AGREGAR ===
+  type Agg = { total: number; dentro: number; fuera: number; sumMeses: number; nMeses: number };
+  const byCarr: Record<string, Agg> = {};
+  const global: Agg = { total: 0, dentro: 0, fuera: 0, sumMeses: 0, nMeses: 0 };
+
+  type Dist = Record<TramoKey, number>;
+  const distGlobal: Dist = { "0–3": 0, "4–6": 0, "7–12": 0, "13+": 0, "sin dato": 0 };
+  const distCarr: Record<string, Dist> = {};
+
+  // Conteo de ingresos (texto tal cual)
+  const ingresoConteo: Record<string, number> = {};
+
+  for (let r = 1; r < respVals.length; r++) {
+    const row = respVals[r];
+
+    const carrera = norm(row[iCarr]) || "(Sin carrera)";
+    const perfil = toPerfil(row[iPerf]);
+    const meses = parseMonths(row[iMes]);
+
+    const ingresoTxt = norm(row[iIng]);
+    if (ingresoTxt) {
+      ingresoConteo[ingresoTxt] = (ingresoConteo[ingresoTxt] ?? 0) + 1;
+    }
+
+    if (!byCarr[carrera]) {
+      byCarr[carrera] = { total: 0, dentro: 0, fuera: 0, sumMeses: 0, nMeses: 0 };
+      distCarr[carrera] = { "0–3": 0, "4–6": 0, "7–12": 0, "13+": 0, "sin dato": 0 };
+    }
+    const A = byCarr[carrera];
+
+    A.total++;
+    global.total++;
+
+    if (perfil === "si") {
+      A.dentro++; global.dentro++;
+    } else if (perfil === "no") {
+      A.fuera++; global.fuera++;
+    }
+
+    if (meses !== null) {
+      A.sumMeses += meses; A.nMeses++;
+      global.sumMeses += meses; global.nMeses++;
+    }
+
+    const t = tramo(meses);
+    distCarr[carrera][t]++; distGlobal[t]++;
+  }
+
+  // === SALIDA ===
+  const old = workbook.getWorksheet(OUT_SHEET);
+  if (old) old.delete();
+  const shOut = workbook.addWorksheet(OUT_SHEET);
+
+  // Título
+  const title = shOut.getRange("A1");
+  title.setValue("REPORTE GENERAL DE EGRESADOS");
+  title.getFormat().getFont().setBold(true);
+  title.getFormat().getFont().setSize(16);
+
+  // Global
+  shOut.getRange("A3").setValue("Global");
+  shOut.getRange("A3").getFormat().getFont().setBold(true);
+
+  const hdrG = ["Total", "Dentro perfil", "Fuera perfil", "% en perfil", "Meses prom."];
+  const rowG = [
+    global.total,
+    global.dentro,
+    global.fuera,
+    pct(global.dentro, global.dentro + global.fuera),
+    prom(global.sumMeses, global.nMeses)
+  ];
+
+  shOut.getRange("A4").getResizedRange(0, hdrG.length - 1).setValues([hdrG]);
+  shOut.getRange("A5").getResizedRange(0, rowG.length - 1).setValues([rowG]);
+  shOut.getRange("D5").setNumberFormatLocal("0.0%");
+  shOut.getRange("E5").setNumberFormatLocal("0.0");
+
+  // Por carrera
+  shOut.getRange("A7").setValue("Por carrera");
+  shOut.getRange("A7").getFormat().getFont().setBold(true);
+
+  const hdrC = ["Carrera", "Total", "Dentro", "Fuera", "% en perfil", "Meses prom."];
+  shOut.getRange("A8").getResizedRange(0, hdrC.length - 1).setValues([hdrC]);
+
+  const carreras = Object.keys(byCarr).sort((a, b) => a.localeCompare(b, "es"));
+  const rowsC = carreras.map(c => {
+    const A = byCarr[c];
+    const den = A.dentro + A.fuera;
+    return [
+      c,
+      A.total,
+      A.dentro,
+      A.fuera,
+      pct(A.dentro, den),
+      prom(A.sumMeses, A.nMeses)
+    ];
+  });
+
+  if (rowsC.length) {
+    shOut.getRangeByIndexes(8, 0, rowsC.length, hdrC.length).setValues(rowsC);
+    shOut.getRangeByIndexes(8, 4, rowsC.length, 1).setNumberFormatLocal("0.0%");
+    shOut.getRangeByIndexes(8, 5, rowsC.length, 1).setNumberFormatLocal("0.0");
+  }
+
+  const tblCarr = shOut.addTable(
+    shOut.getRangeByIndexes(7, 0, Math.max(2, rowsC.length + 1), hdrC.length),
+    true
+  );
+  tblCarr.setPredefinedTableStyle("TableStyleMedium9");
+
+  // === Distribución global por tramos (como TABLA) ===
+  let pos = 10 + rowsC.length;
+  shOut.getRange(`A${pos}`).setValue("Distribución global por meses");
+  shOut.getRange(`A${pos}`).getFormat().getFont().setBold(true);
+
+  const hdrD = ["Tramo", "Casos"];
+  const dRows = [
+    ["0–3", distGlobal["0–3"]],
+    ["4–6", distGlobal["4–6"]],
+    ["7–12", distGlobal["7–12"]],
+    ["13+", distGlobal["13+"]],
+    ["sin dato", distGlobal["sin dato"]]
+  ];
+
+  // encabezados + datos
+  shOut.getRangeByIndexes(pos + 1, 0, 1, hdrD.length).setValues([hdrD]);
+  shOut.getRangeByIndexes(pos + 2, 0, dRows.length, hdrD.length).setValues(dRows);
+
+  // tabla bonita
+  const tblMeses = shOut.addTable(
+    shOut.getRangeByIndexes(pos + 1, 0, Math.max(2, dRows.length + 1), hdrD.length),
+    true
+  );
+  tblMeses.setPredefinedTableStyle("TableStyleMedium2");
+
+  // gráfico
+  const chartRange = shOut.getRangeByIndexes(pos + 1, 0, dRows.length + 1, 2);
+  const ch = shOut.addChart(ExcelScript.ChartType.columnClustered, chartRange);
+  ch.getTitle().setText("Distribución global por tramos de meses");
+  ch.getLegend().setPosition(ExcelScript.ChartLegendPosition.bottom);
+  ch.setPosition(
+    shOut.getRange(`G${pos}`),
+    shOut.getRange(`N${pos + 10}`)
+  );
+
+  // === Distribución por tramos (por carrera) ===
+  pos += dRows.length + 4;
+  shOut.getRange(`A${pos}`).setValue("Distribución por tramos (por carrera)");
+  shOut.getRange(`A${pos}`).getFormat().getFont().setBold(true);
+
+  const dHdr = ["Carrera", "0–3", "4–6", "7–12", "13+", "sin dato"];
+  const dCarrRows = carreras.map(c => {
+    const D = distCarr[c];
+    return [c, D["0–3"], D["4–6"], D["7–12"], D["13+"], D["sin dato"]];
+  });
+
+  shOut.getRangeByIndexes(pos + 1, 0, 1, dHdr.length).setValues([dHdr]);
+  if (dCarrRows.length) {
+    shOut.getRangeByIndexes(pos + 2, 0, dCarrRows.length, dHdr.length).setValues(dCarrRows);
+    const tblDist = shOut.addTable(
+      shOut.getRangeByIndexes(pos + 1, 0, Math.max(2, dCarrRows.length + 1), dHdr.length),
+      true
+    );
+    tblDist.setPredefinedTableStyle("TableStyleMedium2");
+  }
+
+  // === Distribución de ingresos (como TABLA) ===
+  pos = pos + dCarrRows.length + 5;
+  shOut.getRange(`A${pos}`).setValue("Distribución de ingresos (conteo por rango)");
+  shOut.getRange(`A${pos}`).getFormat().getFont().setBold(true);
+
+  const ingKeys = Object.keys(ingresoConteo).sort();
+  const ingRows: (string | number)[][] = [["Rango de ingreso", "Casos"]];
+  for (const k of ingKeys) {
+    ingRows.push([k, ingresoConteo[k]]);
+  }
+
+  // datos
+  shOut.getRangeByIndexes(pos + 1, 0, ingRows.length, 2).setValues(ingRows);
+
+  // tabla bonita
+  const tblIng = shOut.addTable(
+    shOut.getRangeByIndexes(pos + 1, 0, Math.max(2, ingRows.length), 2),
+    true
+  );
+  tblIng.setPredefinedTableStyle("TableStyleMedium4");
+
+  // gráfico de ingresos
+  const ingChartRange = shOut.getRangeByIndexes(pos + 1, 0, ingRows.length, 2);
+  const chIng = shOut.addChart(ExcelScript.ChartType.columnClustered, ingChartRange);
+  chIng.getTitle().setText("Distribución de ingresos");
+  chIng.setPosition(
+    shOut.getRange(`G${pos}`),
+    shOut.getRange(`N${pos + 12}`)
+  );
+
+  // Formato general
+  const used = shOut.getUsedRange();
+  if (used) {
+    used.getFormat().getFont().setName("Calibri");
+    used.getFormat().getFont().setSize(11);
+    used.getFormat().autofitColumns();
+    used.getFormat().autofitRows();
+  }
+}
