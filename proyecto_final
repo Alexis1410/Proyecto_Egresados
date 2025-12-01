@@ -72,10 +72,22 @@ function main(workbook: ExcelScript.Workbook) {
     return Math.round(n);
   };
 
+  // Extrae año 4 dígitos o 2 dígitos plausibles (12 -> 2012, 24 -> 2024)
   const extractYearFromString = (s: string): string => {
-    const all = (s || "").match(/20\d{2}/g);
-    if (all && all.length) {
-      return String(Math.max(...all.map(x => parseInt(x, 10))));
+    if (!s) return "";
+    const all4 = (s || "").match(/20\d{2}/g);
+    if (all4 && all4.length) {
+      return String(Math.max(...all4.map(x => parseInt(x, 10))));
+    }
+    // buscar 2 dígitos plausibles (12..99) y mapear a 20xx (aceptamos desde 2012)
+    const two = (s || "").match(/\b(\d{2})\b/g);
+    if (two) {
+      // tomar el mayor plausible >=12
+      const cand = two.map(x => parseInt(x, 10)).filter(n => !isNaN(n) && n >= 12 && n <= 99);
+      if (cand.length) {
+        const best = Math.max(...cand);
+        return String(2000 + best);
+      }
     }
     return "";
   };
@@ -88,10 +100,13 @@ function main(workbook: ExcelScript.Workbook) {
     return "";
   };
 
+  // normalizeYear ahora acepta numeros, serials y abreviaciones 2 dígitos -> 20xx.
   const normalizeYear = (val: unknown, fallbackText: string): string => {
     if (typeof val === "number") {
       const n = Math.trunc(val);
-      if (n >= 2000 && n <= 2100) return String(n);
+      if (n >= 2012 && n <= 2100) return String(n);
+      // algunas respuestas vienen como 24 (número) -> tratar 2 dígitos
+      if (n >= 12 && n <= 99) return String(2000 + n);
       if (n > 30000) {
         const y = excelSerialToYear(n);
         if (y) return y;
@@ -102,7 +117,8 @@ function main(workbook: ExcelScript.Workbook) {
     if (yText) return yText;
 
     const yFb = extractYearFromString(fallbackText);
-    return yFb || "";
+    if (yFb) return yFb;
+    return "";
   };
 
   const semesterOf = (texto: string): "Ene-Jun" | "Ago-Dic" | "Sin periodo" => {
@@ -529,29 +545,99 @@ function main(workbook: ExcelScript.Workbook) {
   const iIngreso = colIdx("cuál fue el ingreso promedio que recibiste en tu primer empleo");
   const iTit = colIdx("estás titulado");
 
+  // --- detectar columna de timestamp / marca de tiempo / tiempo ---
+  const iTimeCandidates = ["timestamp", "marca de tiempo", "hora", "fecha", "tiempo"];
+  let iTime = -1;
+  for (let i = 0; i < sHdr.length; i++) {
+    if (iTimeCandidates.some(c => sHdr[i].includes(c))) { iTime = i; break; }
+  }
+
   if ([iEmail, iTel, iNom, iYear, iCarr, iAplica, iMeses, iIngreso, iTit].some(i => i < 0)) {
     shKPI.getRange("A1").setValue("No se encontraron todos los encabezados requeridos en la hoja de respuestas.");
     return;
   }
 
+  // --- yesNo mejorada (patrones negativos y positivos) ---
   const yesNo = (v: unknown): "si" | "no" | "" => {
     const s = norm(clean(v));
     if (!s) return "";
-    if (/^(s[ií]|si|sí)$/.test(s) || /aplica|en perfil/.test(s)) return "si";
-    if (/^no\b/.test(s) || /fuera/.test(s)) return "no";
-    return s.includes("sí") || s.includes("si") ? "si" : (s.includes("no") ? "no" : "");
-  };
 
+    // NEGATIVOS (cualquier texto que empiece con "no" y frases tipo "por el momento", "por ahora", "aún no", "pendiente", "en espera")
+    const negPatterns: RegExp[] = [
+      /^no\b/i,
+      /\bno\s*(alcanz|alcancé|alcance|alcanzó|alcans?o)\b/i,
+      /\bno\s*(entreg|entregu|entregó|entregue|entregad|no\s*entreg[ao]s?)\b/i,
+      /\bme\s*falta\b/i,
+      /\b(espero|esperando?)\b.*\bfecha\b/i,
+      /\bno\s*pue?d[eo]\b/i,
+      /\bno\s*asist/i,
+      /\bno\s*aplica\b/i,
+      /\bno\s+lo\s+entreg/i,
+      /\bno\s*(la|el)?\s*alcan\b/i,
+      /^por el momento\b/i,
+      /^por ahora\b/i,
+      /\b(aún|aun)\s*no\b/i,
+      /\bpendiente\b/i,
+      /\ben\s*espera\b/i
+    ];
+    if (negPatterns.some(rx => rx.test(s))) return "no";
+
+    // POSITIVOS (variantes que implican 'sí' como "tengo", "lo aplico", "aplico", "desarrollo", "tiene que ver", "uso", "trabajo en", "aplico", "lo uso")
+    const posPatterns: RegExp[] = [
+      /(^|\s)tengo(\b|$)/i,
+      /(^|\s)lo\s+aplic[oa]/i,
+      /\baplico\b/i,
+      /\baplic?ación\b/i,
+      /\bdesarroll/i,
+      /\btiene\s+que\s+ver\b/i,
+      /\brelaciona/i,
+      /\buso\b/i,
+      /\blo\s+uso\b/i,
+      /\btrabaj/i,
+      /\bestoy\s+aplic/i,
+      /\ben\s+mi\s+trabajo\b/i,
+      /\benperfil|en perfil|enelperfil/i
+    ];
+    if (posPatterns.some(rx => rx.test(s))) return "si";
+
+    // patrones originales que mantienen mapeos (sí / si / proceso / tram)
+    if (/^(s[ií]|si|sí)$/.test(s)) return "si";
+    if (/aplica|en perfil|estoy|^tal vez\b|^talvez\b|proceso|tram/i.test(s)) return "si";
+
+    if (/fuera/i.test(s)) return "no";
+    if (s.includes("sí") || s.includes("si")) return "si";
+    if (s.includes("no")) return "no";
+    return "";
+  };
+  // --- end yesNo ---
+
+  // --- parseMonths: devuelve límite superior para rangos (p.ej. "3-6 meses" -> 6) ---
   const parseMonths = (v: unknown): number => {
-    const s = norm(clean(v));
+    const raw = clean(v);
+    const s = norm(raw);
     if (!s) return NaN;
-    if (/\b0\s*a\s*3\b/.test(s)) return 1.5;
-    if (/\b4\s*a\s*6\b/.test(s)) return 5;
-    if (/\b7\s*a\s*12\b/.test(s)) return 9.5;
-    if (/más\s*de\s*12|mas\s*de\s*12|13\+|12\+/.test(s)) return 14;
-    const m = s.match(/(\d+)\s*(mes|m$)/);
-    if (m) return parseFloat(m[1]);
+
     if (/inmediato|inmediata|inmediatamente|al instante|altiro/.test(s)) return 0;
+
+    let m = s.match(/(\d+)\s*[-–]\s*(\d+)/);
+    if (!m) m = s.match(/(\d+)\s*a\s*(\d+)/);
+    if (m) {
+      const hi = parseInt(m[2], 10);
+      return isNaN(hi) ? NaN : hi;
+    }
+
+    if (/más\s*de\s*(\d+)/i.test(s) || /mas\s*de\s*(\d+)/i.test(s)) {
+      const mm = s.match(/(?:más\s*de|mas\s*de)\s*(\d+)/i);
+      if (mm) {
+        const base = parseInt(mm[1], 10);
+        if (!isNaN(base)) return base + 2;
+      }
+      return 14;
+    }
+
+    const single = s.match(/(\d+)\b/);
+    if (single) return parseInt(single[1], 10);
+
     return NaN;
   };
 
@@ -577,12 +663,14 @@ function main(workbook: ExcelScript.Workbook) {
     ingresoSum: number;
     ingresoN: number;
     titulados: number;
+    ingresoRawList: string[]; // <-- almacenamos las respuestas crudas para modo
   };
   const byKey: { [key: string]: Agg } = {};
 
+  // --- NUEVO: encabezado que SOLO incluye las respuestas raw (quitadas las columnas numéricas) ---
   const cleanHeader = [
     "Correo", "Telefono", "Nombre", "Año", "Carrera",
-    "AplicaPerfil", "Meses1erEmpleo", "Ingreso1erEmpleo", "Titulado"
+    "AplicaPerfil", "Meses1erEmpleo_Raw", "Ingreso1erEmpleo_Raw", "Titulado"
   ];
   const cleanRows: (string | number)[][] = [];
 
@@ -600,29 +688,48 @@ function main(workbook: ExcelScript.Workbook) {
     const carrera = toTitle(carreraRaw.replace(/20\d{2}(\s*-\s*\d{2})?/g, "").trim());
 
     const aplica = yesNo(row[iAplica]);
-    const meses = parseMonths(row[iMeses]);
-    const ingreso = parseMoney(row[iIngreso]);
-    const tit = yesNo(row[iTit]);
+    // Guardamos las respuestas crudas
+    const mesesRaw = clean(row[iMeses]);
+    const ingresoRaw = clean(row[iIngreso]);
 
+    // conversiones internas para KPI (se siguen calculando pero NO se escriben en la hoja "limpio")
+    const mesesNum = parseMonths(mesesRaw);
+    const ingresoNum = parseMoney(ingresoRaw);
+    let tit = yesNo(row[iTit]);
+
+    // si hay columna timestamp y valor presente, y tit está vacío -> marcar 'si'
+    if ((!tit || tit === "") && iTime >= 0) {
+      const tVal = row[iTime];
+      if (tVal !== null && tVal !== undefined && String(tVal).toString().trim() !== "") {
+        tit = "si";
+      }
+    }
+
+    // Escribimos SOLO las columnas raw en la hoja 'Respuestas (limpio)'
     cleanRows.push([
       email, tel, nombreFull, year || "", carrera,
-      aplica || "", isNaN(meses) ? "" : meses, isNaN(ingreso) ? "" : ingreso, tit || ""
+      aplica || "", mesesRaw, ingresoRaw, tit || ""
     ]);
 
-    if (!year || !carrera) continue;
-    const key = `${carrera}||${year}`;
+    // Aún usamos los valores numéricos para agregados KPI
+    const keyCarr = carrera || "(Sin carrera)";
+    const keyYear = year || "Sin año";
+    const key = `${keyCarr}||${keyYear}`;
     if (!byKey[key]) {
-      byKey[key] = { total: 0, enPerfil: 0, fueraPerfil: 0, mesesSum: 0, mesesN: 0, ingresoSum: 0, ingresoN: 0, titulados: 0 };
+      byKey[key] = { total: 0, enPerfil: 0, fueraPerfil: 0, mesesSum: 0, mesesN: 0, ingresoSum: 0, ingresoN: 0, titulados: 0, ingresoRawList: [] };
     }
     const bucket = byKey[key];
     bucket.total++;
     if (aplica === "si") bucket.enPerfil++;
     else if (aplica === "no") bucket.fueraPerfil++;
-    if (!isNaN(meses)) { bucket.mesesSum += meses; bucket.mesesN++; }
-    if (!isNaN(ingreso)) { bucket.ingresoSum += ingreso; bucket.ingresoN++; }
+    if (!isNaN(mesesNum)) { bucket.mesesSum += mesesNum; bucket.mesesN++; }
+    if (!isNaN(ingresoNum)) { bucket.ingresoSum += ingresoNum; bucket.ingresoN++; }
     if (tit === "si") bucket.titulados++;
+    // guardar la respuesta cruda (incluso vacía) para luego calcular modo
+    bucket.ingresoRawList.push(ingresoRaw);
   }
 
+  // escribir clean table (ahora SIN columnas numéricas)
   shClean.getRange("A1").getResizedRange(0, cleanHeader.length - 1).setValues([cleanHeader]);
   if (cleanRows.length) {
     shClean.getRangeByIndexes(1, 0, cleanRows.length, cleanHeader.length).setValues(cleanRows);
@@ -635,18 +742,43 @@ function main(workbook: ExcelScript.Workbook) {
   }
 
   // ===== INDICADORES KPI =====
-  // *** columna 'Meses a 1er empleo (prom)' eliminada ***
   const kHeader: string[] = [
     "Carrera", "Año de Egreso", "Respuestas",
     "En perfil (aplicando)", "Fuera de perfil",
-    "% En perfil", "Ingreso promedio 1er empleo", "% Titulados"
+    "% En perfil", "Ingreso1erEmpleo_Raw (modo)", "% Titulados"
   ];
   shKPI.getRange("A1").getResizedRange(0, kHeader.length - 1).setValues([kHeader]);
+
+  // función helper: calcular modo (respuesta cruda más frecuente, ignorar cadenas vacías)
+  const modeString = (arr: string[]): string => {
+    const counts: { [s: string]: number } = {};
+    let best = "";
+    let bestN = 0;
+    for (let i = 0; i < arr.length; i++) {
+      const v = (arr[i] || "").toString().trim();
+      if (!v) continue;
+      const k = v;
+      counts[k] = (counts[k] || 0) + 1;
+      if (counts[k] > bestN) { bestN = counts[k]; best = k; }
+    }
+    return best;
+  };
+
+  // Ordenar keys: primero por carrera, después por año numérico (Sin año -> 0)
+  const parseKeyYear = (ky: string): number => {
+    const p = ky.split("||");
+    const y = p[1] ?? "";
+    const n = parseInt(y, 10);
+    if (!isNaN(n)) return n;
+    return 0;
+  };
 
   const keys = Object.keys(byKey).sort((a, b) => {
     const [ca, ya] = a.split("||"); const [cb, yb] = b.split("||");
     if (ca !== cb) return ca.localeCompare(cb, "es", { sensitivity: "base" });
-    return parseInt(ya, 10) - parseInt(yb, 10);
+    const na = parseKeyYear(a);
+    const nb = parseKeyYear(b);
+    return nb - na; // descendente por año
   });
 
   const kRows: (string | number)[][] = [];
@@ -654,13 +786,14 @@ function main(workbook: ExcelScript.Workbook) {
     const [carr, year] = keys[i].split("||");
     const a = byKey[keys[i]];
     const pctPerfil = a.total ? a.enPerfil / a.total : 0;
-    const promIngreso = a.ingresoN ? a.ingresoSum / a.ingresoN : 0;
+    // obtener modo de las respuestas crudas de ingreso
+    const ingresoModo = modeString(a.ingresoRawList) || ""; // cadena vacía si no hay respuestas útiles
     const pctTit = a.total ? a.titulados / a.total : 0;
 
     kRows.push([
       carr, year, a.total,
       a.enPerfil, a.fueraPerfil,
-      pctPerfil, promIngreso, pctTit
+      pctPerfil, ingresoModo, pctTit
     ]);
   }
 
@@ -668,8 +801,7 @@ function main(workbook: ExcelScript.Workbook) {
     shKPI.getRangeByIndexes(1, 0, kRows.length, kHeader.length).setValues(kRows);
     // % En perfil (columna 5)
     shKPI.getRangeByIndexes(1, 5, kRows.length, 1).setNumberFormatLocal("0.0%");
-    // Ingreso promedio (columna 6)
-    shKPI.getRangeByIndexes(1, 6, kRows.length, 1).setNumberFormatLocal("$ #,##0");
+    // Ingreso (columna 6) lo dejamos como texto (raw modo), no formatear
     // % Titulados (columna 7)
     shKPI.getRangeByIndexes(1, 7, kRows.length, 1).setNumberFormatLocal("0.0%");
 
