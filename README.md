@@ -241,3 +241,86 @@ Corre el flujo completo de manera secuencial.
 Obtiene Base Maestra final y Resumen visual.
 Deja el archivo listo para presentación o envío institucional.
 
+parte 3
+Manual de Usuario: Variación de Carreras – Reporte de Egresados
+1. Propósito
+Este script de Excel permite analizar los datos de egresados, mostrando:
+Cuántos alumnos están trabajando en su perfil profesional.
+Tiempo promedio que tardan en conseguir su primer empleo.
+
+Distribución de ingresos.
+Comparación por carrera y reporte global.
+Está pensado para entregar a la academia información confiable y visual de los resultados de los egresados.
+
+2. Preparación de los datos
+El archivo Excel debe contener una hoja llamada “Respondieron” con todas las respuestas de los egresados.
+Las columnas mínimas requeridas son:
+Carrera de egreso (o sinónimo).
+Si labora aplicando su carrera (o sinónimo).
+Tiempo hasta primer empleo (meses o rangos de tiempo).
+Ingreso promedio del primer empleo.
+
+Notas:
+Los nombres de las columnas pueden variar, el script detecta sinónimos automáticamente.
+Las respuestas de texto que indiquen “aún no” o “no he tenido empleo” se excluyen de los cálculos de empleo.
+
+3. Estructura de los reportes
+El script genera:
+
+3.1 Hoja “Resumen empleo”
+Resumen global:
+Total de egresados.
+Número y porcentaje que laboran en su perfil.
+Tiempo promedio en meses hasta su primer empleo.
+
+Resumen por carrera:
+Total de egresados por carrera.
+Número y porcentaje que laboran en su perfil.
+Tiempo promedio hasta primer empleo.
+Distribución global por tramos de meses:
+Tramos: 0–3, 4–6, 7–12, 13+ meses, y “sin dato”.
+Gráfico de columnas mostrando la cantidad de egresados por tramo.
+Distribución por tramos por carrera:
+Muestra la cantidad de egresados en cada tramo por carrera.
+Se visualiza como tabla y gráfico.
+Distribución de ingresos (conteo por rango):
+Tablas y gráficos que muestran cuántos egresados reportan cada rango de ingreso.
+Datos presentados globalmente, sin distinguir entre carreras.
+
+3.2 Hojas individuales por carrera
+Una hoja por cada carrera, con nombre limpio y seguro para Excel.
+
+Incluye:
+Resumen: Total, dentro/fuera de perfil, % en perfil, tiempo promedio.
+Distribución por tramos de meses: tabla y gráfico.
+Distribución de ingresos por carrera: tabla y gráfico.
+Mensaje “Sin respuestas de ingreso para esta carrera” si no hay datos de ingresos.
+
+4. Cómo interpretar los reportes
+% en perfil: indica cuántos egresados están trabajando en un área relacionada con su carrera.
+Meses promedio: tiempo que tardaron en conseguir el primer empleo.
+Distribución de tramos: permite ver la rapidez con que los egresados encuentran empleo.
+Distribución de ingresos: permite ver el rango de remuneración y su frecuencia.
+
+5. Mejoras implementadas respecto al script anterior “Resumen Empleo”
+Conteo de ingresos por carrera, no solo global.
+Creación de hojas individuales por carrera para análisis más detallado.
+Gráficos mejor organizados, con títulos claros y legibles.
+Mensajes automáticos para carreras sin datos de ingresos.
+Estilo uniforme: fuente, tamaño, autofit y tablas estilizadas en todas las hojas.
+Sanitización de nombres de hojas, evitando errores por caracteres inválidos o nombres largos.
+
+6. Partes que se pueden mejorar o personalizar
+Detección de columnas: ampliar lista de sinónimos o permitir selección manual.
+Rangos de tiempo: parametrizar los tramos o calcular percentiles.
+Ingresos: agregar cálculo de ingreso promedio o mediana numérica real.
+Validación de datos: limpieza de texto para evitar duplicados o espacios.
+Gráficos: agregar gráficos de línea, porcentaje acumulado o comparativos.
+Interactividad: incluir filtros dinámicos, segmentadores o botones de selección por rango de meses, ingresos o carreras.
+
+7. Uso recomendado
+Mantener la hoja de respuestas limpia y con nombres claros de columnas.
+Ejecutar el script para generar el Resumen global y las hojas de cada carrera.
+Revisar los gráficos y tablas para detectar tendencias o áreas de mejora.
+Entregar a la academia como reporte consolidado o por carrera según necesidad.
+
