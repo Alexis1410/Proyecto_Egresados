@@ -1,9 +1,8 @@
 # Proyecto_Egresados
-este repositorio incluye los codigo para egresados de la base tecnm
-manual de usuario que se ira actualizado acorde a lo que este se necesite
-
-Instructivo — Automatización de “Base Maestra” y Resumen de Egresados (2022–2025)
-Autor: Alexis (con soporte de Office Scripts)
+Este repositorio incluye los codigos para egresados de la base TecNM.
+Manual de usuario que se ira actualizado acorde a lo que este se necesite.
+Instructivo — Automatización de “Base Maestra” y Resumen de Egresados (2022–2025).
+Autor: A-E(con soporte de Office Scripts).
 1. Objetivo
 Centralizar información de egresados (2022–2025) y futuras actualizaciones a 2026 y 2027 en una Base Maestra y generar un Resumen con indicadores y gráficas por Carrera, Sexo y Periodo de egreso (Ene–Jun, Ago–Dic) con estética clara.
 2. Requisitos previos
@@ -72,25 +71,7 @@ const DATA="Base Maestra"; const OUT="Resumen";
 •	Rendimiento: no lea celdas dentro de bucles; use getUsedRange().getValues() y procese en memoria.
 •	El Núm. de control no aparece: asegúrese de que alguna columna incluya “control”, “matr”, “núm”; si no, el unificador lo infiere por patrón.
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 Presentacion
-
 FLUJO GENERAL DEL SISTEMA DE SEGUIMIENTO A EGRESADOS
 1️ Generar el cuestionario
 •	Se diseña el instrumento de recolección de datos con base en los objetivos educacionales y atributos de egreso.
